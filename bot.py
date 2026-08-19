@@ -1,11 +1,18 @@
+"""
+bot.py — Multi-user Telegram bot for NFT minting on multiple chains.
+
+Each user gets their own encrypted wallet (via db.py), per-user concurrency
+locks, and per-user state (active network, mode, sniper settings).
+Default network: Robinhood Chain (chain ID 4663).
+"""
+
 import os
 import re
 import json
 import asyncio
 import time
-from functools import wraps
+from collections import defaultdict
 from typing import Optional, Set
-from dataclasses import dataclass
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,443 +23,452 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
-from web3 import Web3
-from eth_abi import decode
 from dotenv import load_dotenv
+
+import db
+from mint_engine import (
+    get_balance,
+    execute_withdraw,
+    execute_mint,
+    execute_copy_mint,
+    parse_mint_quantity,
+    MINT_SIGNATURES,
+)
 
 load_dotenv()
 
 # ============================================================================
-# CONFIGURATION & STATE
+# CONFIGURATION
 # ============================================================================
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-ALLOWED_USER_ID = os.getenv("ALLOWED_USER_ID")
-HTTP_RPC = os.getenv("HTTP_RPC")
-WS_RPC = os.getenv("WS_RPC")
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+if not BOT_TOKEN:
+    raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment variables.")
 
-if not all([BOT_TOKEN, ALLOWED_USER_ID, HTTP_RPC, WS_RPC, PRIVATE_KEY]):
-    raise ValueError("Missing critical configuration variables in .env")
-
-ALLOWED_USER_ID = int(ALLOWED_USER_ID)
-
-w3 = Web3(Web3.HTTPProvider(HTTP_RPC))
-account = w3.eth.account.from_key(PRIVATE_KEY)
-user_address = account.address
-
-tx_lock = asyncio.Lock()
-
-class BotState:
-    def __init__(self):
-        self.mode = "MANUAL"  # "MANUAL" or "AUTO"
-        self.default_qty = 1
-        self.default_priority_gwei = 2
-        self.default_value = 0.0
-        
-        # Sniper Settings
-        self.sniper_active = False
-        self.dry_run = True
-        self.target_wallet = os.getenv("TARGET_WALLET", "").lower()
-        self.daily_limit_eth = float(os.getenv("DAILY_LIMIT_ETH", "5.0"))
-        self.max_base_fee_gwei = int(os.getenv("MAX_BASE_FEE_GWEI", "150"))
-        self.gas_bump_percent = 30
-        self.max_priority_gwei = 50
-        
-        # Sniper Tracking
-        self.seen_txs: Set[str] = set()
-        self.daily_spent_eth = 0.0
-        self.daily_reset_time = time.time()
-        self.successful_copies = 0
-        self.failed_copies = 0
-        self.sniper_task: Optional[asyncio.Task] = None
-
-    def check_daily_limit(self, amount_eth: float) -> bool:
-        if time.time() - self.daily_reset_time > 86400:
-            self.daily_spent_eth = 0.0
-            self.daily_reset_time = time.time()
-        return (self.daily_spent_eth + amount_eth) <= self.daily_limit_eth
-
-    def is_seen(self, tx_hash: str) -> bool:
-        if tx_hash in self.seen_txs:
-            return True
-        self.seen_txs.add(tx_hash)
-        if len(self.seen_txs) > 10000:
-            self.seen_txs = set(list(self.seen_txs)[-5000:])
-        return False
-
-STATE = BotState()
-
-MINT_SIGNATURES = {
-    "0x1249c58b": ("mint()", [], None),
-    "0xa0712d68": ("mint(uint256)", ["uint256"], 0),
-    "0x6c2a8e54": ("mintPublic(uint256)", ["uint256"], 0),
-    "0x8b94d9a5": ("mintPublic(uint256)", ["uint256"], 0),
-    "0xefef39a1": ("mint(uint256,uint256,bytes)", ["uint256", "uint256", "bytes"], 0),
-    "0x2309bbed": ("mint(uint256,bytes32[])", ["uint256", "bytes32[]"], 0),
-    "0x7ba6b3f1": ("whitelistMint(uint256,bytes32[])", ["uint256", "bytes32[]"], 0),
-    "0x4a7d1d5c": ("mint(uint256,bytes)", ["uint256", "bytes"], 0),
+# Multi-chain registry.
+# Robinhood Chain (chain ID 4663) is its own separate L2 built on Arbitrum
+# Orbit — it is NOT Arbitrum One. It has its own RPC and deployments.
+NETWORKS = {
+    "robinhood": os.getenv("ROBINHOOD_RPC", "https://rpc.mainnet.chain.robinhood.com"),
+    "arb":       os.getenv("ARB_RPC", "https://arb1.arbitrum.io/rpc"),
+    "base":      os.getenv("BASE_RPC", "https://mainnet.base.org"),
+    "eth":       os.getenv("ETH_RPC", "https://eth.llamarpc.com"),
 }
 
-DEFAULT_MINT_ABI = [
-    {
-        "inputs": [{"internalType": "uint256", "name": "quantity", "type": "uint256"}],
-        "name": "mint",
-        "outputs": [],
-        "stateMutability": "payable",
-        "type": "function",
+WS_RPC = os.getenv("WS_RPC", "")
+
+# Safety defaults
+DEFAULT_MAX_BASE_FEE_GWEI = int(os.getenv("MAX_BASE_FEE_GWEI", "100"))
+DEFAULT_DAILY_LIMIT_ETH = float(os.getenv("DAILY_LIMIT_ETH", "0.05"))
+
+# ============================================================================
+# PER-USER STATE
+# ============================================================================
+
+# Per-user asyncio locks — prevents nonce collisions for a single user
+# while letting different users transact concurrently.
+user_locks = defaultdict(asyncio.Lock)
+
+
+def _default_user_state() -> dict:
+    """Factory for per-user state."""
+    return {
+        "network": "robinhood",
+        "mode": "MANUAL",
+        # Mint defaults
+        "default_qty": 1,
+        "default_priority_gwei": 2,
+        "default_value": 0.0,
+        # Sniper settings
+        "sniper_active": False,
+        "dry_run": True,
+        "target_wallet": "",
+        "daily_limit_eth": DEFAULT_DAILY_LIMIT_ETH,
+        "max_base_fee_gwei": DEFAULT_MAX_BASE_FEE_GWEI,
+        "gas_bump_percent": 30,
+        "max_priority_gwei": 50,
+        # Sniper tracking
+        "seen_txs": set(),
+        "daily_spent_eth": 0.0,
+        "daily_reset_time": time.time(),
+        "successful_copies": 0,
+        "failed_copies": 0,
+        "sniper_task": None,
     }
-]
+
+
+user_states = defaultdict(_default_user_state)
+
 
 # ============================================================================
-# AUTHENTICATION & KEYBOARD BUILDERS
+# UTILITY FUNCTIONS
 # ============================================================================
 
-def authorized_only(func):
-    @wraps(func)
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
-        user_id = update.effective_user.id if update.effective_user else None
-        if user_id != ALLOWED_USER_ID:
-            if update.effective_message:
-                await update.effective_message.reply_text("Unauthorized. Access denied.")
-            return
-        return await func(update, context, *args, **kwargs)
-    return wrapper
+def _get_rpc(user_id: int) -> str:
+    """Get the active RPC URL for a user."""
+    return NETWORKS[user_states[user_id]["network"]]
 
-def build_manual_keyboard(selected_qty: int, selected_gas: int) -> InlineKeyboardMarkup:
+
+def _check_daily_limit(user_id: int, amount_eth: float) -> bool:
+    """Check if adding amount_eth would exceed the user's daily limit."""
+    state = user_states[user_id]
+    if time.time() - state["daily_reset_time"] > 86400:
+        state["daily_spent_eth"] = 0.0
+        state["daily_reset_time"] = time.time()
+    return (state["daily_spent_eth"] + amount_eth) <= state["daily_limit_eth"]
+
+
+def _is_seen(user_id: int, tx_hash: str) -> bool:
+    """Dedup check for sniper transactions."""
+    state = user_states[user_id]
+    seen: Set[str] = state["seen_txs"]
+    if tx_hash in seen:
+        return True
+    seen.add(tx_hash)
+    if len(seen) > 10000:
+        state["seen_txs"] = set(list(seen)[-5000:])
+    return False
+
+
+async def delete_message_task(
+    chat_id: int,
+    message_id: int,
+    delay: int,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Background task to delete a message after `delay` seconds."""
+    await asyncio.sleep(delay)
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        print(f"Failed to delete message {message_id}: {e}")
+
+
+def build_manual_keyboard(
+    selected_qty: int, selected_gas: int
+) -> InlineKeyboardMarkup:
     """Builds interactive inline keyboard with selected visual states."""
     qty_buttons = []
     for q in [1, 2, 5]:
         label = f"✅ {q}" if q == selected_qty else f"Qty: {q}"
-        qty_buttons.append(InlineKeyboardButton(label, callback_data=f"qty_{q}"))
+        qty_buttons.append(
+            InlineKeyboardButton(label, callback_data=f"qty_{q}")
+        )
 
-    gas_options = [(2, "Standard (2 Gwei)"), (5, "Fast (5 Gwei)"), (10, "Turbo (10 Gwei)")]
+    gas_options = [
+        (2, "Standard (2 Gwei)"),
+        (5, "Fast (5 Gwei)"),
+        (10, "Turbo (10 Gwei)"),
+    ]
     gas_buttons = []
     for g_val, g_label in gas_options:
         label = f"✅ {g_label}" if g_val == selected_gas else g_label
-        gas_buttons.append(InlineKeyboardButton(label, callback_data=f"gas_{g_val}"))
+        gas_buttons.append(
+            InlineKeyboardButton(label, callback_data=f"gas_{g_val}")
+        )
 
     keyboard = [
         qty_buttons,
         gas_buttons,
-        [InlineKeyboardButton("⚡ Confirm & Mint", callback_data="confirm_mint")]
+        [InlineKeyboardButton("⚡ Confirm & Mint", callback_data="confirm_mint")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
-# ============================================================================
-# WEB3 EXECUTION UTILITIES
-# ============================================================================
-
-def verify_contract_exists(address: str) -> str:
-    checksum_addr = Web3.to_checksum_address(address)
-    code = w3.eth.get_code(checksum_addr)
-    if code in (b"", b"\x00", "0x", b"0x"):
-        raise ValueError(f"Address {checksum_addr} has no bytecode. Target is an EOA or uninitialized contract.")
-    return checksum_addr
-
-def parse_mint_quantity(input_data: str, func_sig: str) -> int:
-    if func_sig not in MINT_SIGNATURES:
-        return 1
-    name, types, qty_idx = MINT_SIGNATURES[func_sig]
-    if not types:
-        return 1
-    hex_str = input_data[2:] if input_data.startswith("0x") else input_data
-    data = hex_str[8:]
-    if len(data) < 64:
-        return 1
-    try:
-        encoded = bytes.fromhex(data)
-        decoded = decode(types, encoded)
-        if qty_idx is not None and qty_idx < len(decoded):
-            qty = decoded[qty_idx]
-            if isinstance(qty, int) and 0 < qty <= 100:
-                return qty
-    except Exception:
-        pass
-    return 1
-
-def execute_mint(contract_address: str, quantity: int = 1, value_eth: float = 0.0, max_priority_fee_gwei: int = 2) -> str:
-    target_addr = verify_contract_exists(contract_address)
-    contract = w3.eth.contract(address=target_addr, abi=DEFAULT_MINT_ABI)
-    
-    required_value_wei = w3.to_wei(value_eth, "ether")
-    current_balance = w3.eth.get_balance(account.address)
-    if current_balance < required_value_wei:
-        raise ValueError(f"Insufficient balance. Required: {value_eth} ETH, Available: {w3.from_wei(current_balance, 'ether'):.5f} ETH.")
-
-    nonce = w3.eth.get_transaction_count(account.address, "pending")
-    latest_block = w3.eth.get_block("latest")
-    
-    tx_data = {
-        "from": account.address,
-        "value": required_value_wei,
-        "nonce": nonce,
-        "chainId": w3.eth.chain_id,
-    }
-    
-    if "baseFeePerGas" in latest_block and latest_block["baseFeePerGas"] is not None:
-        base_fee = latest_block["baseFeePerGas"]
-        base_fee_gwei = w3.from_wei(base_fee, "gwei")
-        if base_fee_gwei > STATE.max_base_fee_gwei:
-            raise RuntimeError(f"Base fee ({base_fee_gwei:.1f} Gwei) exceeds ceiling ({STATE.max_base_fee_gwei} Gwei).")
-        priority_fee = w3.to_wei(max_priority_fee_gwei, "gwei")
-        tx_data["maxFeePerGas"] = int(base_fee * 1.5) + priority_fee
-        tx_data["maxPriorityFeePerGas"] = priority_fee
-    else:
-        tx_data["gasPrice"] = w3.eth.gas_price
-
-    tx = contract.functions.mint(quantity).build_transaction(tx_data)
-    
-    try:
-        estimated_gas = w3.eth.estimate_gas(tx)
-        tx["gas"] = int(estimated_gas * 1.2)
-    except Exception as sim_err:
-        raise RuntimeError(f"Simulation failed (transaction would revert): {sim_err}") from sim_err
-
-    signed_tx = w3.eth.account.sign_transaction(tx, private_key=PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
-    return w3.to_hex(tx_hash)
-
-def execute_copy_mint(
-    contract_address: str,
-    raw_calldata: str,
-    quantity: int,
-    value_eth: float,
-    target_gas_price: Optional[int],
-    target_max_fee: Optional[int],
-    target_priority: Optional[int]
-) -> Optional[str]:
-    if not STATE.check_daily_limit(value_eth):
-        raise RuntimeError(f"Daily limit would be exceeded on mint price ({STATE.daily_spent_eth}/{STATE.daily_limit_eth} ETH)")
-
-    target_addr = verify_contract_exists(contract_address)
-    required_value_wei = w3.to_wei(value_eth, "ether")
-    current_balance = w3.eth.get_balance(user_address)
-
-    if current_balance < required_value_wei:
-        raise ValueError("Insufficient balance for copy trade.")
-
-    nonce = w3.eth.get_transaction_count(user_address, "pending")
-    latest_block = w3.eth.get_block("latest")
-    data = raw_calldata if raw_calldata.startswith("0x") else "0x" + raw_calldata
-
-    tx_data = {
-        "from": user_address,
-        "to": target_addr,
-        "value": required_value_wei,
-        "nonce": nonce,
-        "chainId": w3.eth.chain_id,
-        "data": data,
-    }
-
-    if "baseFeePerGas" in latest_block and latest_block["baseFeePerGas"]:
-        base_fee = latest_block["baseFeePerGas"]
-        if target_priority:
-            bumped = int(target_priority * (1 + STATE.gas_bump_percent / 100))
-            priority_fee = min(bumped, w3.to_wei(STATE.max_priority_gwei, "gwei"))
-        else:
-            priority_fee = w3.to_wei(2, "gwei")
-        max_fee = min(int(base_fee * 1.5) + priority_fee, w3.to_wei(STATE.max_base_fee_gwei, "gwei"))
-        tx_data["maxFeePerGas"] = max_fee
-        tx_data["maxPriorityFeePerGas"] = priority_fee
-    else:
-        gas_price = int(target_gas_price * (1 + STATE.gas_bump_percent / 100)) if target_gas_price else w3.eth.gas_price
-        tx_data["gasPrice"] = min(gas_price, w3.to_wei(STATE.max_base_fee_gwei, "gwei"))
-
-    estimated = w3.eth.estimate_gas(tx_data)
-    tx_data["gas"] = int(estimated * 1.2)
-
-    total_cost_wei = required_value_wei + (tx_data["gas"] * tx_data.get("maxFeePerGas", tx_data.get("gasPrice", 0)))
-    total_cost_eth = float(w3.from_wei(total_cost_wei, "ether"))
-
-    if not STATE.check_daily_limit(total_cost_eth):
-        raise RuntimeError(f"Daily limit exceeded including gas ({STATE.daily_spent_eth + total_cost_eth:.4f}/{STATE.daily_limit_eth} ETH)")
-
-    if STATE.dry_run:
-        return f"[DRY_RUN_PASS] Simulated {quantity} NFTs for {total_cost_eth:.4f} ETH total"
-
-    signed = w3.eth.account.sign_transaction(tx_data, private_key=PRIVATE_KEY)
-    tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)
-    STATE.daily_spent_eth += total_cost_eth
-    return w3.to_hex(tx_hash)
 
 # ============================================================================
-# MEMPOOL SNIPER BACKGROUND WORKER
+# ONBOARDING COMMANDS
 # ============================================================================
 
-async def mempool_worker(app):
-    from websockets import connect
-    while STATE.sniper_active:
-        try:
-            if not STATE.target_wallet or not STATE.target_wallet.startswith("0x") or len(STATE.target_wallet) != 42:
-                await app.bot.send_message(chat_id=ALLOWED_USER_ID, text="⚠️ *Sniper paused:* Invalid target wallet configured.", parse_mode="Markdown")
-                STATE.sniper_active = False
-                break
-
-            async with connect(WS_RPC) as ws:
-                await ws.send(json.dumps({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "eth_subscribe",
-                    "params": ["alchemy_pendingTransactions", {"fromAddress": [STATE.target_wallet]}]
-                }))
-                
-                await ws.recv()
-                await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=f"🎯 *Mempool Sniper Listening*\nTarget: `{STATE.target_wallet}`\nMode: `{'DRY RUN' if STATE.dry_run else 'LIVE'}`", parse_mode="Markdown")
-
-                while STATE.sniper_active:
-                    msg = json.loads(await ws.recv())
-                    if "params" in msg and "result" in msg["params"]:
-                        tx_data = msg["params"]["result"]
-                        tx = tx_data if isinstance(tx_data, dict) else w3.eth.get_transaction(tx_data)
-                        
-                        tx_hash = tx.get("hash")
-                        if isinstance(tx_hash, bytes):
-                            tx_hash = tx_hash.hex()
-                        elif isinstance(tx_hash, str) and not tx_hash.startswith("0x"):
-                            tx_hash = "0x" + tx_hash
-
-                        if STATE.is_seen(tx_hash):
-                            continue
-
-                        input_data = tx.get("input") or ""
-                        if isinstance(input_data, bytes):
-                            input_data = input_data.hex()
-
-                        if len(input_data) < 10:
-                            continue
-
-                        func_sig = input_data[:10].lower()
-                        if func_sig not in MINT_SIGNATURES:
-                            continue
-
-                        qty = parse_mint_quantity(input_data, func_sig)
-                        val_eth = float(w3.from_wei(int(tx.get("value", 0)), "ether"))
-                        
-                        await app.bot.send_message(
-                            chat_id=ALLOWED_USER_ID,
-                            text=f"🎯 *Target Mint Detected in Mempool!*\nTarget: `{STATE.target_wallet}`\nContract: `{tx.get('to')}`\nQty: `{qty}` | Val: `{val_eth} ETH`\nExecuting copy...",
-                            parse_mode="Markdown"
-                        )
-
-                        try:
-                            result = execute_copy_mint(
-                                contract_address=tx.get("to"),
-                                raw_calldata=input_data,
-                                quantity=qty,
-                                value_eth=val_eth,
-                                target_gas_price=tx.get("gasPrice"),
-                                target_max_fee=tx.get("maxFeePerGas"),
-                                target_priority=tx.get("maxPriorityFeePerGas")
-                            )
-                            STATE.successful_copies += 1
-                            await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=f"✅ *Sniper Result:*\n`{result}`", parse_mode="Markdown")
-                        except Exception as e:
-                            STATE.failed_copies += 1
-                            await app.bot.send_message(chat_id=ALLOWED_USER_ID, text=f"❌ *Sniper Skipped/Failed:*\n`{str(e)}`", parse_mode="Markdown")
-        except Exception as e:
-            await asyncio.sleep(2)
-
-# ============================================================================
-# BOT COMMAND HANDLERS
-# ============================================================================
-
-@authorized_only
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bal = w3.from_wei(w3.eth.get_balance(user_address), "ether")
+    """Welcome message shown on first interaction."""
     await update.message.reply_text(
-        f"🤖 *NFT Mint & Sniper Suite Active*\n\n"
-        f"Wallet: `{user_address}`\n"
-        f"Balance: `{bal:.4f} ETH`\n"
-        f"Manual Mode: *{STATE.mode}*\n"
-        f"Sniper Active: *{STATE.sniper_active}* (Dry Run: `{STATE.dry_run}`)\n\n"
-        f"*Commands:*\n"
-        f"• `/mode` : Toggle AUTO/MANUAL minting\n"
-        f"• `/snipe` : Start/Stop Mempool Sniper\n"
-        f"• `/target <addr>` : Set copy-trade target wallet\n"
-        f"• `/dryrun` : Toggle Dry Run on/off\n"
-        f"• `/status` : View current system status\n\n"
-        f"Paste any EVM contract address to mint directly.",
-        parse_mode="Markdown"
+        "🤖 *Welcome to the Multi-Chain Minting Suite*\n\n"
+        "This bot gives you a dedicated execution wallet for minting.\n\n"
+        "*Getting Started:*\n"
+        "1. `/wallet` — Create your wallet (private key shown once)\n"
+        "2. `/deposit` — Get your deposit address\n"
+        "3. Fund your wallet, then paste any contract address to mint\n\n"
+        "*Wallet Commands:*\n"
+        "• `/balance` — Check your balance\n"
+        "• `/withdraw <amount> <address>` — Send funds out\n"
+        "• `/deposit` — Show your deposit address\n\n"
+        "*Minting Commands:*\n"
+        "• `/mode` — Toggle AUTO/MANUAL minting\n"
+        "• `/network <name>` — Switch chains (robinhood, arb, base, eth)\n\n"
+        "*Sniper Commands:*\n"
+        "• `/snipe` — Start/Stop mempool sniper\n"
+        "• `/target <address>` — Set copy-trade target wallet\n"
+        "• `/dryrun` — Toggle dry run on/off\n"
+        "• `/status` — View full system status\n\n"
+        "Default network: *Robinhood Chain* (Chain ID 4663).",
+        parse_mode="Markdown",
     )
 
-@authorized_only
-async def toggle_mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE.mode = "AUTO" if STATE.mode == "MANUAL" else "MANUAL"
-    await update.message.reply_text(f"Direct Mint Mode switched to: *{STATE.mode}*", parse_mode="Markdown")
 
-@authorized_only
-async def toggle_snipe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE.sniper_active = not STATE.sniper_active
-    if STATE.sniper_active:
-        if not STATE.target_wallet or not STATE.target_wallet.startswith("0x") or len(STATE.target_wallet) != 42:
-            STATE.sniper_active = False
-            await update.message.reply_text("❌ Please set a valid target wallet first using `/target 0x...`", parse_mode="Markdown")
-            return
-        STATE.sniper_task = asyncio.create_task(mempool_worker(context.application))
-        await update.message.reply_text("🚀 *Sniper Activated!* Listening for target transactions...", parse_mode="Markdown")
-    else:
-        if STATE.sniper_task:
-            STATE.sniper_task.cancel()
-        await update.message.reply_text("🛑 *Sniper Deactivated.*", parse_mode="Markdown")
+async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Create wallet on first call (shows key once). Repeat calls show address only."""
+    user_id = update.effective_user.id
+    wallet = db.get_or_create_wallet(user_id)
 
-@authorized_only
-async def set_target_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not wallet["created"]:
+        # Wallet already exists — show address only, never re-expose the key
+        await update.message.reply_text(
+            f"You already have a wallet:\n`{wallet['address']}`\n\n"
+            f"Your private key was shown once at creation.\n"
+            f"Use `/deposit` to see your address anytime.",
+            parse_mode="Markdown",
+        )
+        return
+
+    # First time — show the key in a self-destructing message
+    msg = await update.message.reply_text(
+        f"🔐 *Your Execution Wallet — Created*\n\n"
+        f"Address:\n`{wallet['address']}`\n\n"
+        f"Private Key:\n`{wallet['private_key']}`\n\n"
+        f"⚠️ *Save this now — this message self-destructs in 5 minutes "
+        f"and the key won't be shown again.*\n"
+        f"Don't keep large amounts here.",
+        parse_mode="Markdown",
+    )
+    # Schedule deletion after 300 seconds (5 minutes)
+    asyncio.create_task(
+        delete_message_task(update.effective_chat.id, msg.message_id, 300, context)
+    )
+
+
+async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show deposit address (address-only lookup, no key decryption)."""
+    user_id = update.effective_user.id
+    address = db.get_address(user_id)
+    if not address:
+        await update.message.reply_text(
+            "No wallet found. Use `/wallet` to create one.",
+            parse_mode="Markdown",
+        )
+        return
+    network = user_states[user_id]["network"]
+    await update.message.reply_text(
+        f"📥 *Deposit Address* ({network.upper()}):\n`{address}`",
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================================
+# BALANCE, NETWORK, MODE COMMANDS
+# ============================================================================
+
+async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Check balance on the user's active network (address-only, no key needed)."""
+    user_id = update.effective_user.id
+    address = db.get_address(user_id)
+    if not address:
+        await update.message.reply_text(
+            "No wallet found. Use `/wallet` to create one.",
+            parse_mode="Markdown",
+        )
+        return
+
+    network_key = user_states[user_id]["network"]
+    try:
+        bal = get_balance(NETWORKS[network_key], address)
+        await update.message.reply_text(
+            f"📊 Balance on *{network_key.upper()}*:\n`{bal:.4f} ETH`",
+            parse_mode="Markdown",
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Error fetching balance: {str(e)}")
+
+
+async def network_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Switch the active chain for this user."""
+    user_id = update.effective_user.id
     if not context.args:
-        await update.message.reply_text(f"Current target: `{STATE.target_wallet}`\n\nUsage: `/target 0x1234...`", parse_mode="Markdown")
+        current = user_states[user_id]["network"]
+        available = ", ".join(NETWORKS.keys())
+        await update.message.reply_text(
+            f"Current network: *{current.upper()}*\n"
+            f"Available: {available}\n"
+            f"Usage: `/network <name>`",
+            parse_mode="Markdown",
+        )
         return
-    new_target = context.args[0].strip().lower()
-    if not re.match(r"^0x[a-fA-F0-9]{40}$", new_target):
-        await update.message.reply_text("❌ Invalid EVM address format.")
+
+    choice = context.args[0].lower()
+    if choice not in NETWORKS:
+        await update.message.reply_text(
+            f"Unknown network. Available: {', '.join(NETWORKS.keys())}"
+        )
         return
-    STATE.target_wallet = new_target
-    await update.message.reply_text(f"🎯 Target wallet updated to:\n`{STATE.target_wallet}`", parse_mode="Markdown")
 
-@authorized_only
-async def toggle_dryrun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE.dry_run = not STATE.dry_run
-    await update.message.reply_text(f"Dry Run mode set to: *{STATE.dry_run}*", parse_mode="Markdown")
-
-@authorized_only
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bal = w3.from_wei(w3.eth.get_balance(user_address), "ether")
+    user_states[user_id]["network"] = choice
     await update.message.reply_text(
-        f"📊 *System Status*\n\n"
-        f"• Wallet: `{user_address}`\n"
-        f"• Balance: `{bal:.4f} ETH`\n"
-        f"• Mint Mode: *{STATE.mode}*\n"
-        f"• Sniper Active: *{STATE.sniper_active}*\n"
-        f"• Sniper Dry Run: *{STATE.dry_run}*\n"
-        f"• Target Wallet: `{STATE.target_wallet or 'None set'}`\n"
-        f"• Sniper Stats: {STATE.successful_copies} ok / {STATE.failed_copies} failed\n"
-        f"• Daily Spent: `{STATE.daily_spent_eth:.4f} / {STATE.daily_limit_eth} ETH`",
-        parse_mode="Markdown"
+        f"Network switched to *{choice.upper()}*",
+        parse_mode="Markdown",
     )
 
+
+async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle between AUTO and MANUAL minting modes."""
+    user_id = update.effective_user.id
+    state = user_states[user_id]
+    state["mode"] = "AUTO" if state["mode"] == "MANUAL" else "MANUAL"
+    await update.message.reply_text(
+        f"Mint mode switched to: *{state['mode']}*",
+        parse_mode="Markdown",
+    )
+
+
 # ============================================================================
-# DIRECT MINT HANDLERS
+# WITHDRAW
 # ============================================================================
 
-@authorized_only
+async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send ETH from the user's bot wallet to an external address."""
+    user_id = update.effective_user.id
+    wallet = db.get_user_wallet(user_id)  # key genuinely needed — signs a tx
+    if not wallet:
+        await update.message.reply_text(
+            "No wallet found. Use `/wallet` to create one.",
+            parse_mode="Markdown",
+        )
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "Usage: `/withdraw <amount> <destination_address>`",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        amount = float(context.args[0])
+        to_address = context.args[1]
+    except ValueError:
+        await update.message.reply_text("Invalid amount format.")
+        return
+
+    if not re.match(r"^0x[a-fA-F0-9]{40}$", to_address):
+        await update.message.reply_text("Invalid destination address format.")
+        return
+
+    rpc_url = _get_rpc(user_id)
+    msg = await update.message.reply_text("⏳ Processing withdrawal...")
+
+    async with user_locks[user_id]:
+        loop = asyncio.get_running_loop()
+        try:
+            tx_hash = await loop.run_in_executor(
+                None, execute_withdraw, rpc_url, wallet["private_key"],
+                to_address, amount,
+            )
+            await msg.edit_text(
+                f"✅ *Withdrawal Successful*\nTX: `{tx_hash}`",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            await msg.edit_text(f"❌ *Failed:*\n{str(e)}")
+
+
+# ============================================================================
+# DIRECT MINT (address paste handler + inline buttons)
+# ============================================================================
+
+async def dispatch_mint(
+    user_id: int,
+    chat_id: int,
+    contract_address: str,
+    qty: int,
+    value: float,
+    priority_gwei: int,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Execute a mint, locked per-user to prevent nonce collisions."""
+    wallet = db.get_user_wallet(user_id)
+    if not wallet:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="No wallet found. Use `/wallet` first.",
+            parse_mode="Markdown",
+        )
+        return
+
+    rpc_url = _get_rpc(user_id)
+    max_base_fee = user_states[user_id]["max_base_fee_gwei"]
+
+    async with user_locks[user_id]:
+        loop = asyncio.get_running_loop()
+        try:
+            tx_hash = await loop.run_in_executor(
+                None,
+                execute_mint,
+                rpc_url,
+                wallet["private_key"],
+                contract_address,
+                qty,
+                value,
+                priority_gwei,
+                max_base_fee,
+            )
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🚀 *Mint Broadcasted*\nTX: `{tx_hash}`",
+                parse_mode="Markdown",
+            )
+        except RuntimeError as e:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ *Mint Aborted (Simulation Failed)*\n`{str(e)}`\n\n"
+                    f"*No gas was spent.*"
+                ),
+                parse_mode="Markdown",
+            )
+        except ValueError as e:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ *Invalid Target*\n{str(e)}",
+                parse_mode="Markdown",
+            )
+        except Exception as e:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"🚨 *Broadcast Error*\n`{str(e)}`",
+                parse_mode="Markdown",
+            )
+
+
 async def handle_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Detect pasted contract addresses and route to mint flow."""
     text = update.message.text.strip()
     if not re.match(r"^0x[a-fA-F0-9]{40}$", text):
-        await update.message.reply_text("Invalid EVM address format.")
+        return  # Not an address — ignore silently
+
+    user_id = update.effective_user.id
+    state = user_states[user_id]
+
+    # Check wallet exists
+    if not db.get_address(user_id):
+        await update.message.reply_text(
+            "No wallet found. Use `/wallet` to create one first.",
+            parse_mode="Markdown",
+        )
         return
 
     context.user_data["target_contract"] = text
 
-    if STATE.mode == "AUTO":
-        await update.message.reply_text(f"Auto Mode: Simulating `{text}`...", parse_mode="Markdown")
-        async with tx_lock:
-            try:
-                loop = asyncio.get_running_loop()
-                tx_hash = await loop.run_in_executor(None, execute_mint, text, STATE.default_qty, STATE.default_value, STATE.default_priority_gwei)
-                await update.message.reply_text(f"🚀 *Mint Broadcasted*\nTX: `{tx_hash}`", parse_mode="Markdown")
-            except Exception as e:
-                await update.message.reply_text(f"❌ *Mint Aborted:*\n`{str(e)}`", parse_mode="Markdown")
+    if state["mode"] == "AUTO":
+        await update.message.reply_text(
+            f"Auto Mode: Simulating `{text}`...",
+            parse_mode="Markdown",
+        )
+        await dispatch_mint(
+            user_id, update.effective_chat.id, text,
+            state["default_qty"], state["default_value"],
+            state["default_priority_gwei"], context,
+        )
         return
 
+    # MANUAL mode — show quantity and gas picker
     context.user_data["selected_qty"] = 1
     context.user_data["selected_gas"] = 2
 
@@ -460,13 +476,15 @@ async def handle_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Contract: `{text}`\nChoose quantity and gas below, then confirm:",
         reply_markup=keyboard,
-        parse_mode="Markdown"
+        parse_mode="Markdown",
     )
 
-@authorized_only
+
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button clicks for manual mint flow."""
     query = update.callback_query
     await query.answer()
+    user_id = update.effective_user.id
     data = query.data
 
     qty = context.user_data.get("selected_qty", 1)
@@ -475,37 +493,350 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("qty_"):
         qty = int(data.split("_")[1])
         context.user_data["selected_qty"] = qty
-        await query.edit_message_reply_markup(reply_markup=build_manual_keyboard(qty, gas))
+        await query.edit_message_reply_markup(
+            reply_markup=build_manual_keyboard(qty, gas)
+        )
 
     elif data.startswith("gas_"):
         gas = int(data.split("_")[1])
         context.user_data["selected_gas"] = gas
-        await query.edit_message_reply_markup(reply_markup=build_manual_keyboard(qty, gas))
+        await query.edit_message_reply_markup(
+            reply_markup=build_manual_keyboard(qty, gas)
+        )
 
     elif data == "confirm_mint":
         contract = context.user_data.get("target_contract")
-        await query.edit_message_text(f"⏳ Simulating and broadcasting for `{contract}`...", parse_mode="Markdown")
-        
-        async with tx_lock:
-            try:
-                loop = asyncio.get_running_loop()
-                tx_hash = await loop.run_in_executor(None, execute_mint, contract, qty, 0.0, gas)
-                await query.message.reply_text(f"🚀 *Mint Successful!*\nTX Hash:\n`{tx_hash}`", parse_mode="Markdown")
-            except Exception as e:
-                await query.message.reply_text(f"❌ *Mint Aborted (Simulation Failed)*\n\n`{str(e)}`\n\n*Zero gas spent.*", parse_mode="Markdown")
+        if not contract:
+            await query.edit_message_text("No contract address set. Paste one first.")
+            return
+        await query.edit_message_text(
+            f"⏳ Simulating and broadcasting for `{contract}`...",
+            parse_mode="Markdown",
+        )
+        await dispatch_mint(
+            user_id, update.effective_chat.id, contract, qty, 0.0, gas, context
+        )
+
+
+# ============================================================================
+# SNIPER COMMANDS
+# ============================================================================
+
+async def toggle_snipe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start or stop the mempool sniper for this user."""
+    user_id = update.effective_user.id
+    state = user_states[user_id]
+
+    if not db.get_address(user_id):
+        await update.message.reply_text(
+            "No wallet found. Use `/wallet` to create one first.",
+            parse_mode="Markdown",
+        )
+        return
+
+    state["sniper_active"] = not state["sniper_active"]
+
+    if state["sniper_active"]:
+        target = state["target_wallet"]
+        if not target or not re.match(r"^0x[a-fA-F0-9]{40}$", target):
+            state["sniper_active"] = False
+            await update.message.reply_text(
+                "❌ Set a valid target wallet first: `/target 0x...`",
+                parse_mode="Markdown",
+            )
+            return
+        if not WS_RPC:
+            state["sniper_active"] = False
+            await update.message.reply_text(
+                "❌ No WS_RPC configured in .env. Sniper requires a WebSocket endpoint.",
+            )
+            return
+        state["sniper_task"] = asyncio.create_task(
+            mempool_worker(user_id, update.effective_chat.id, context.application)
+        )
+        await update.message.reply_text(
+            "🚀 *Sniper Activated!* Listening for target transactions...",
+            parse_mode="Markdown",
+        )
+    else:
+        task = state.get("sniper_task")
+        if task and not task.done():
+            task.cancel()
+        await update.message.reply_text(
+            "🛑 *Sniper Deactivated.*",
+            parse_mode="Markdown",
+        )
+
+
+async def set_target_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Set the wallet address to copy-trade from."""
+    user_id = update.effective_user.id
+    state = user_states[user_id]
+
+    if not context.args:
+        current = state["target_wallet"] or "None set"
+        await update.message.reply_text(
+            f"Current target: `{current}`\n\nUsage: `/target 0x1234...`",
+            parse_mode="Markdown",
+        )
+        return
+
+    new_target = context.args[0].strip().lower()
+    if not re.match(r"^0x[a-fA-F0-9]{40}$", new_target):
+        await update.message.reply_text("❌ Invalid EVM address format.")
+        return
+
+    state["target_wallet"] = new_target
+    await update.message.reply_text(
+        f"🎯 Target wallet updated to:\n`{state['target_wallet']}`",
+        parse_mode="Markdown",
+    )
+
+
+async def toggle_dryrun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle dry-run mode for the sniper."""
+    user_id = update.effective_user.id
+    state = user_states[user_id]
+    state["dry_run"] = not state["dry_run"]
+    await update.message.reply_text(
+        f"Dry Run mode set to: *{state['dry_run']}*",
+        parse_mode="Markdown",
+    )
+
+
+async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show full status for this user — wallet, balance, sniper, etc."""
+    user_id = update.effective_user.id
+    address = db.get_address(user_id)
+    state = user_states[user_id]
+    network_key = state["network"]
+
+    if not address:
+        await update.message.reply_text(
+            "No wallet found. Use `/wallet` to create one.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        bal = get_balance(NETWORKS[network_key], address)
+        bal_str = f"{bal:.4f} ETH"
+    except Exception:
+        bal_str = "Error fetching"
+
+    await update.message.reply_text(
+        f"📊 *System Status*\n\n"
+        f"• Wallet: `{address}`\n"
+        f"• Network: *{network_key.upper()}*\n"
+        f"• Balance: `{bal_str}`\n"
+        f"• Mint Mode: *{state['mode']}*\n"
+        f"• Sniper Active: *{state['sniper_active']}*\n"
+        f"• Sniper Dry Run: *{state['dry_run']}*\n"
+        f"• Target Wallet: `{state['target_wallet'] or 'None set'}`\n"
+        f"• Sniper Stats: {state['successful_copies']} ok / "
+        f"{state['failed_copies']} failed\n"
+        f"• Daily Spent: `{state['daily_spent_eth']:.4f} / "
+        f"{state['daily_limit_eth']} ETH`",
+        parse_mode="Markdown",
+    )
+
+
+# ============================================================================
+# MEMPOOL SNIPER BACKGROUND WORKER (per-user)
+# ============================================================================
+
+async def mempool_worker(user_id: int, chat_id: int, app):
+    """
+    WebSocket listener for a user's target wallet.
+    Runs as a background task per-user.
+    """
+    from websockets import connect
+
+    state = user_states[user_id]
+
+    while state["sniper_active"]:
+        try:
+            target = state["target_wallet"]
+            if not target or not target.startswith("0x") or len(target) != 42:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text="⚠️ *Sniper paused:* Invalid target wallet.",
+                    parse_mode="Markdown",
+                )
+                state["sniper_active"] = False
+                break
+
+            async with connect(WS_RPC) as ws:
+                await ws.send(json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "eth_subscribe",
+                    "params": [
+                        "alchemy_pendingTransactions",
+                        {"fromAddress": [target]},
+                    ],
+                }))
+
+                await ws.recv()  # subscription confirmation
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🎯 *Mempool Sniper Listening*\n"
+                        f"Target: `{target}`\n"
+                        f"Mode: `{'DRY RUN' if state['dry_run'] else 'LIVE'}`"
+                    ),
+                    parse_mode="Markdown",
+                )
+
+                while state["sniper_active"]:
+                    raw = await ws.recv()
+                    msg = json.loads(raw)
+                    if "params" not in msg or "result" not in msg["params"]:
+                        continue
+
+                    tx_data = msg["params"]["result"]
+                    # Alchemy can return full tx object or just a hash
+                    from web3 import Web3
+                    if isinstance(tx_data, str):
+                        w3 = Web3(Web3.HTTPProvider(_get_rpc(user_id)))
+                        tx = w3.eth.get_transaction(tx_data)
+                    else:
+                        tx = tx_data
+
+                    tx_hash = tx.get("hash")
+                    if isinstance(tx_hash, bytes):
+                        tx_hash = tx_hash.hex()
+                    elif isinstance(tx_hash, str) and not tx_hash.startswith("0x"):
+                        tx_hash = "0x" + tx_hash
+
+                    if _is_seen(user_id, tx_hash):
+                        continue
+
+                    input_data = tx.get("input") or ""
+                    if isinstance(input_data, bytes):
+                        input_data = input_data.hex()
+                    if len(input_data) < 10:
+                        continue
+
+                    func_sig = input_data[:10].lower()
+                    if func_sig not in MINT_SIGNATURES:
+                        continue
+
+                    qty = parse_mint_quantity(input_data, func_sig)
+                    val_eth = float(Web3.from_wei(int(tx.get("value", 0)), "ether"))
+
+                    # Check daily limit
+                    if not _check_daily_limit(user_id, val_eth):
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"⚠️ *Sniper Skip:* Daily limit would be exceeded "
+                                f"({state['daily_spent_eth']:.4f}/{state['daily_limit_eth']} ETH)"
+                            ),
+                            parse_mode="Markdown",
+                        )
+                        continue
+
+                    await app.bot.send_message(
+                        chat_id=chat_id,
+                        text=(
+                            f"🎯 *Target Mint Detected in Mempool!*\n"
+                            f"Target: `{target}`\n"
+                            f"Contract: `{tx.get('to')}`\n"
+                            f"Qty: `{qty}` | Val: `{val_eth} ETH`\n"
+                            f"Executing copy..."
+                        ),
+                        parse_mode="Markdown",
+                    )
+
+                    # Execute copy mint
+                    wallet = db.get_user_wallet(user_id)
+                    if not wallet:
+                        await app.bot.send_message(
+                            chat_id=chat_id,
+                            text="❌ Wallet not found. Cannot execute copy mint.",
+                        )
+                        continue
+
+                    rpc_url = _get_rpc(user_id)
+
+                    async with user_locks[user_id]:
+                        loop = asyncio.get_running_loop()
+                        try:
+                            result = await loop.run_in_executor(
+                                None,
+                                execute_copy_mint,
+                                rpc_url,
+                                wallet["private_key"],
+                                tx.get("to"),
+                                input_data,
+                                qty,
+                                val_eth,
+                                tx.get("gasPrice"),
+                                tx.get("maxFeePerGas"),
+                                tx.get("maxPriorityFeePerGas"),
+                                state["gas_bump_percent"],
+                                state["max_priority_gwei"],
+                                state["max_base_fee_gwei"],
+                                state["dry_run"],
+                            )
+                            state["successful_copies"] += 1
+                            if not state["dry_run"]:
+                                # Track spend only on live trades
+                                # (approximation — actual spend calculated inside engine)
+                                state["daily_spent_eth"] += val_eth
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"✅ *Sniper Result:*\n`{result}`",
+                                parse_mode="Markdown",
+                            )
+                        except Exception as e:
+                            state["failed_copies"] += 1
+                            await app.bot.send_message(
+                                chat_id=chat_id,
+                                text=f"❌ *Sniper Failed:*\n`{str(e)}`",
+                                parse_mode="Markdown",
+                            )
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"Sniper reconnecting for user {user_id}: {e}")
+            await asyncio.sleep(2)
+
+
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Onboarding
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("mode", toggle_mode_cmd))
+    app.add_handler(CommandHandler("wallet", wallet_cmd))
+    app.add_handler(CommandHandler("deposit", deposit_cmd))
+
+    # Wallet operations
+    app.add_handler(CommandHandler("balance", balance_cmd))
+    app.add_handler(CommandHandler("withdraw", withdraw_cmd))
+
+    # Network & mode
+    app.add_handler(CommandHandler("network", network_cmd))
+    app.add_handler(CommandHandler("mode", mode_cmd))
+
+    # Sniper
     app.add_handler(CommandHandler("snipe", toggle_snipe_cmd))
     app.add_handler(CommandHandler("target", set_target_cmd))
     app.add_handler(CommandHandler("dryrun", toggle_dryrun_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
+
+    # Address paste + inline buttons
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address))
     app.add_handler(CallbackQueryHandler(handle_callback))
-    
+
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
