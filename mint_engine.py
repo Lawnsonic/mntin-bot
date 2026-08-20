@@ -37,6 +37,17 @@ MINT_SIGNATURES = {
     "0x4a7d1d5c": ("mint(uint256,bytes)", ["uint256", "bytes"], 0),
 }
 
+# Corrected 4-byte selectors for standard NFT price view functions.
+# Three of the five commonly cited selectors are wrong in most tutorials.
+# These were verified by computing keccak256 of each function signature.
+PRICE_SELECTORS = [
+    "0x13faede6",  # cost()
+    "0xa035b1fe",  # price()
+    "0x6817c76c",  # mintPrice()
+    "0xddca3f43",  # fee()
+    "0x98d5fdca",  # getPrice()
+]
+
 
 # ============================================================================
 # HELPERS
@@ -69,7 +80,6 @@ def _build_fee_fields(
     """
     Populate EIP-1559 or legacy gas fields on tx_data in-place.
     Preserves the base-fee ceiling check from the original codebase.
-    Returns the same dict for chaining convenience.
     """
     latest_block = w3.eth.get_block("latest")
     if latest_block.get("baseFeePerGas") is not None:
@@ -117,9 +127,37 @@ def parse_mint_quantity(input_data: str, func_sig: str) -> int:
 # ============================================================================
 
 def get_balance(rpc_url: str, address: str) -> float:
-    """Get ETH balance for an address. No private key needed."""
+    """Get ETH balance for an address. Returns 0.0 on any failure."""
+    try:
+        w3 = get_w3(rpc_url)
+        checksum = Web3.to_checksum_address(address)
+        return float(w3.from_wei(w3.eth.get_balance(checksum), "ether"))
+    except Exception:
+        return 0.0
+
+
+# ============================================================================
+# MINT PRICE DETECTION
+# ============================================================================
+
+def detect_mint_price(rpc_url: str, contract_address: str) -> Optional[float]:
+    """
+    Probe contract bytecode for standard price view functions.
+    Returns the per-token price in ETH, or None if no price function found.
+    Falls through silently on reverts (most contracts only implement one).
+    """
     w3 = get_w3(rpc_url)
-    return float(w3.from_wei(w3.eth.get_balance(address), "ether"))
+    checksum = Web3.to_checksum_address(contract_address)
+    for selector in PRICE_SELECTORS:
+        try:
+            result = w3.eth.call({"to": checksum, "data": selector})
+            if result and len(result) >= 32:
+                price_wei = int.from_bytes(result[:32], byteorder="big")
+                if price_wei >= 0:
+                    return float(w3.from_wei(price_wei, "ether"))
+        except Exception:
+            continue
+    return None
 
 
 # ============================================================================
@@ -153,8 +191,6 @@ def execute_withdraw(
     }
     tx = _build_fee_fields(w3, tx)
 
-    # estimate_gas instead of hardcoded 21000 — smart-account destinations
-    # on Robinhood Chain may need more gas
     try:
         tx["gas"] = int(w3.eth.estimate_gas(tx) * 1.2)
     except Exception:
@@ -163,7 +199,7 @@ def execute_withdraw(
     fee_per_gas = tx.get("maxFeePerGas", tx.get("gasPrice", 0))
     total_cost = amount_wei + (tx["gas"] * fee_per_gas)
     if balance < total_cost:
-        raise ValueError("Insufficient funds to cover amount + gas.")
+        raise ValueError("Insufficient funds to cover amount plus gas.")
 
     signed_tx = w3.eth.account.sign_transaction(tx, private_key)
     tx_hash = w3.eth.send_raw_transaction(signed_tx.raw_transaction)
@@ -185,6 +221,7 @@ def execute_mint(
 ) -> str:
     """
     Build, simulate, sign and broadcast a mint(uint256) transaction.
+    value_eth is the per-token price. Total value = value_eth * quantity.
     Raises RuntimeError on simulation failure (no gas spent).
     """
     w3 = get_w3(rpc_url)
@@ -193,17 +230,18 @@ def execute_mint(
     target_addr = verify_contract_exists(rpc_url, contract_address)
     contract = w3.eth.contract(address=target_addr, abi=DEFAULT_MINT_ABI)
 
-    required_value_wei = w3.to_wei(value_eth, "ether")
+    # value_eth is per-token price, scale by quantity
+    total_value_wei = w3.to_wei(value_eth * quantity, "ether")
     current_balance = w3.eth.get_balance(account.address)
-    if current_balance < required_value_wei:
+    if current_balance < total_value_wei:
         raise ValueError(
-            f"Insufficient balance. Needed {value_eth} ETH, "
+            f"Insufficient balance. Needed {value_eth * quantity:.5f} ETH, "
             f"wallet holds {w3.from_wei(current_balance, 'ether'):.5f} ETH."
         )
 
     tx_data = {
         "from": account.address,
-        "value": required_value_wei,
+        "value": total_value_wei,
         "nonce": w3.eth.get_transaction_count(account.address, "pending"),
         "chainId": w3.eth.chain_id,
     }
@@ -222,7 +260,7 @@ def execute_mint(
         raise RuntimeError(f"Gas estimation failed: {sim_err}") from sim_err
 
     # Final balance check including gas
-    total_cost = required_value_wei + (
+    total_cost = total_value_wei + (
         tx["gas"] * tx_data.get("maxFeePerGas", tx_data.get("gasPrice", 0))
     )
     if current_balance < total_cost:
@@ -278,7 +316,7 @@ def execute_copy_mint(
         "data": data,
     }
 
-    # Gas fee construction — bump target's gas by gas_bump_percent
+    # Gas fee construction: bump target's gas by gas_bump_percent
     latest_block = w3.eth.get_block("latest")
     if latest_block.get("baseFeePerGas") is not None:
         base_fee = latest_block["baseFeePerGas"]
@@ -311,7 +349,7 @@ def execute_copy_mint(
     total_cost_eth = float(w3.from_wei(total_cost_wei, "ether"))
 
     if current_balance < total_cost_wei:
-        raise ValueError("Insufficient balance for gas + mint.")
+        raise ValueError("Insufficient balance for gas plus mint.")
 
     if dry_run:
         return (

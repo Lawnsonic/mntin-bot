@@ -1,8 +1,10 @@
 """
-bot.py — Multi-user Telegram bot for NFT minting on multiple chains.
+bot.py. Bloom-style interactive multi-user Telegram bot.
 
-Each user gets their own encrypted wallet (via db.py), per-user concurrency
-locks, and per-user state (active network, mode, sniper settings).
+Button-driven UI with step-by-step wizards. No slash commands needed
+beyond /start and /home. Multi-wallet per user, multi-chain support,
+variable mint fee detection, multi-target sniper tracking.
+
 Default network: Robinhood Chain (chain ID 4663).
 """
 
@@ -11,6 +13,7 @@ import re
 import json
 import asyncio
 import time
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional, Set
 
@@ -31,6 +34,7 @@ from mint_engine import (
     execute_withdraw,
     execute_mint,
     execute_copy_mint,
+    detect_mint_price,
     parse_mint_quantity,
     MINT_SIGNATURES,
 )
@@ -45,19 +49,35 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment variables.")
 
-# Multi-chain registry.
-# Robinhood Chain (chain ID 4663) is its own separate L2 built on Arbitrum
-# Orbit — it is NOT Arbitrum One. It has its own RPC and deployments.
+# Multi-chain registry with display metadata.
+# Robinhood Chain (chain ID 4663) is its own L2 built on Arbitrum Orbit.
 NETWORKS = {
-    "robinhood": os.getenv("ROBINHOOD_RPC", "https://rpc.mainnet.chain.robinhood.com"),
-    "arb":       os.getenv("ARB_RPC", "https://arb1.arbitrum.io/rpc"),
-    "base":      os.getenv("BASE_RPC", "https://mainnet.base.org"),
-    "eth":       os.getenv("ETH_RPC", "https://eth.llamarpc.com"),
+    "robinhood": {
+        "name": "Robinhood",
+        "rpc": os.getenv("ROBINHOOD_RPC", "https://rpc.mainnet.chain.robinhood.com"),
+        "ws": os.getenv("ROBINHOOD_WS_RPC", ""),
+        "icon": "🟢",
+    },
+    "arb": {
+        "name": "Arbitrum",
+        "rpc": os.getenv("ARB_RPC", "https://arb1.arbitrum.io/rpc"),
+        "ws": os.getenv("ARB_WS_RPC", ""),
+        "icon": "🔷",
+    },
+    "base": {
+        "name": "Base",
+        "rpc": os.getenv("BASE_RPC", "https://mainnet.base.org"),
+        "ws": os.getenv("BASE_WS_RPC", ""),
+        "icon": "🟦",
+    },
+    "eth": {
+        "name": "Ethereum",
+        "rpc": os.getenv("ETH_RPC", "https://eth.llamarpc.com"),
+        "ws": os.getenv("ETH_WS_RPC", ""),
+        "icon": "💎",
+    },
 }
 
-WS_RPC = os.getenv("WS_RPC", "")
-
-# Safety defaults
 DEFAULT_MAX_BASE_FEE_GWEI = int(os.getenv("MAX_BASE_FEE_GWEI", "100"))
 DEFAULT_DAILY_LIMIT_ETH = float(os.getenv("DAILY_LIMIT_ETH", "0.05"))
 
@@ -65,24 +85,20 @@ DEFAULT_DAILY_LIMIT_ETH = float(os.getenv("DAILY_LIMIT_ETH", "0.05"))
 # PER-USER STATE
 # ============================================================================
 
-# Per-user asyncio locks — prevents nonce collisions for a single user
-# while letting different users transact concurrently.
 user_locks = defaultdict(asyncio.Lock)
 
 
 def _default_user_state() -> dict:
-    """Factory for per-user state."""
     return {
         "network": "robinhood",
         "mode": "MANUAL",
-        # Mint defaults
-        "default_qty": 1,
-        "default_priority_gwei": 2,
-        "default_value": 0.0,
+        "active_wallet_id": None,
+        # Wizard step tracking
+        "step": None,
+        "withdraw_amount": None,
         # Sniper settings
         "sniper_active": False,
         "dry_run": True,
-        "target_wallet": "",
         "daily_limit_eth": DEFAULT_DAILY_LIMIT_ETH,
         "max_base_fee_gwei": DEFAULT_MAX_BASE_FEE_GWEI,
         "gas_bump_percent": 30,
@@ -105,12 +121,32 @@ user_states = defaultdict(_default_user_state)
 # ============================================================================
 
 def _get_rpc(user_id: int) -> str:
-    """Get the active RPC URL for a user."""
-    return NETWORKS[user_states[user_id]["network"]]
+    return NETWORKS[user_states[user_id]["network"]]["rpc"]
+
+
+def _get_active_wallet_id(user_id: int) -> Optional[int]:
+    """Resolve the active wallet_id. Auto-selects first wallet if not set."""
+    state = user_states[user_id]
+    if state["active_wallet_id"] is not None:
+        return state["active_wallet_id"]
+    first = db.get_first_wallet_id(user_id)
+    if first:
+        state["active_wallet_id"] = first
+    return first
+
+
+def _get_active_address(user_id: int) -> Optional[str]:
+    """Get the address of the active wallet without decrypting the key."""
+    wallet_id = _get_active_wallet_id(user_id)
+    if wallet_id is None:
+        return None
+    for w in db.get_wallets(user_id):
+        if w["wallet_id"] == wallet_id:
+            return w["address"]
+    return None
 
 
 def _check_daily_limit(user_id: int, amount_eth: float) -> bool:
-    """Check if adding amount_eth would exceed the user's daily limit."""
     state = user_states[user_id]
     if time.time() - state["daily_reset_time"] > 86400:
         state["daily_spent_eth"] = 0.0
@@ -119,7 +155,6 @@ def _check_daily_limit(user_id: int, amount_eth: float) -> bool:
 
 
 def _is_seen(user_id: int, tx_hash: str) -> bool:
-    """Dedup check for sniper transactions."""
     state = user_states[user_id]
     seen: Set[str] = state["seen_txs"]
     if tx_hash in seen:
@@ -130,265 +165,516 @@ def _is_seen(user_id: int, tx_hash: str) -> bool:
     return False
 
 
-async def delete_message_task(
-    chat_id: int,
-    message_id: int,
-    delay: int,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    """Background task to delete a message after `delay` seconds."""
+async def _delete_after(chat_id: int, message_id: int, delay: int, context):
+    """Background task to delete a message after delay seconds."""
     await asyncio.sleep(delay)
     try:
         await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        print(f"Failed to delete message {message_id}: {e}")
+    except Exception:
+        pass
 
 
-def build_manual_keyboard(
-    selected_qty: int, selected_gas: int
-) -> InlineKeyboardMarkup:
-    """Builds interactive inline keyboard with selected visual states."""
-    qty_buttons = []
-    for q in [1, 2, 5]:
-        label = f"✅ {q}" if q == selected_qty else f"Qty: {q}"
-        qty_buttons.append(
-            InlineKeyboardButton(label, callback_data=f"qty_{q}")
-        )
+def _back_button(target: str = "nav_home") -> list:
+    return [InlineKeyboardButton("« Back", callback_data=target)]
 
-    gas_options = [
-        (2, "Standard (2 Gwei)"),
-        (5, "Fast (5 Gwei)"),
-        (10, "Turbo (10 Gwei)"),
-    ]
-    gas_buttons = []
-    for g_val, g_label in gas_options:
-        label = f"✅ {g_label}" if g_val == selected_gas else g_label
-        gas_buttons.append(
-            InlineKeyboardButton(label, callback_data=f"gas_{g_val}")
-        )
+
+# ============================================================================
+# HOME DASHBOARD
+# ============================================================================
+
+def _build_home(user_id: int) -> tuple:
+    """Build the home dashboard text and keyboard."""
+    state = user_states[user_id]
+    wallets = db.get_wallets(user_id)
+    active_id = _get_active_wallet_id(user_id)
+
+    # Find active wallet info
+    active_label = "None"
+    active_addr = "No wallet created yet"
+    for w in wallets:
+        if w["wallet_id"] == active_id:
+            active_label = w["label"]
+            active_addr = w["address"]
+            break
+
+    # Multi-chain balance scan
+    net_keys = list(NETWORKS.keys())
+    bal_lines = []
+    for i, key in enumerate(net_keys):
+        net = NETWORKS[key]
+        bal = get_balance(net["rpc"], active_addr) if active_addr != "No wallet created yet" else 0.0
+        connector = "└" if i == len(net_keys) - 1 else "├"
+        bal_lines.append(f"{connector} {net['icon']} {key.upper()}: `{bal:.4f} ETH`")
+
+    bal_block = "\n".join(bal_lines)
+    net_name = NETWORKS[state["network"]]["name"]
+    now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+
+    text = (
+        f"🌸 *MintSuite Dashboard*\n\n"
+        f"🔵 *Active Wallet:* {active_label}\n"
+        f"└ `{active_addr}`\n\n"
+        f"💰 *Balances:*\n"
+        f"{bal_block}\n\n"
+        f"⚙️ *Settings:*\n"
+        f"├ Chain: *{net_name}*\n"
+        f"└ Mode: *{state['mode']}*\n\n"
+        f"Paste any contract address to mint.\n\n"
+        f"🕒 Updated: `{now} UTC`"
+    )
 
     keyboard = [
-        qty_buttons,
-        gas_buttons,
+        [
+            InlineKeyboardButton("📥 Deposit", callback_data="menu_deposit"),
+            InlineKeyboardButton("💸 Withdraw", callback_data="menu_withdraw"),
+        ],
+        [
+            InlineKeyboardButton(
+                f"🌐 {state['network'].upper()}", callback_data="menu_network"
+            ),
+            InlineKeyboardButton(
+                f"⚡ {state['mode']}", callback_data="toggle_mode"
+            ),
+        ],
+        [
+            InlineKeyboardButton("🎯 Copy Trade", callback_data="menu_targets"),
+            InlineKeyboardButton("🔐 Wallets", callback_data="menu_wallets"),
+        ],
+        [InlineKeyboardButton("🔄 Refresh", callback_data="nav_home")],
+    ]
+
+    return text, InlineKeyboardMarkup(keyboard)
+
+
+# ============================================================================
+# ENTRY POINT: /start and /home
+# ============================================================================
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    state = user_states[user_id]
+    state["step"] = None
+
+    # Auto-provision W1 on first ever interaction
+    if not db.get_wallets(user_id):
+        async with user_locks[user_id]:
+            created = db.create_wallet(user_id)
+        state["active_wallet_id"] = created["wallet_id"]
+
+        msg = await update.message.reply_text(
+            f"Welcome to MintSuite. {created['label']} has been created.\n\n"
+            f"`{created['address']}`\n\n"
+            f"Private key:\n`{created['private_key']}`\n\n"
+            f"Save this now. This message deletes in 5 minutes "
+            f"and the key will not be shown again here.\n"
+            f"Use the Wallets menu to import or create more.",
+            parse_mode="Markdown",
+        )
+        asyncio.create_task(
+            _delete_after(update.effective_chat.id, msg.message_id, 300, context)
+        )
+
+    text, markup = _build_home(user_id)
+    await update.message.reply_text(text, reply_markup=markup, parse_mode="Markdown")
+
+
+# ============================================================================
+# CALLBACK ROUTER
+# ============================================================================
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    data = query.data
+    state = user_states[user_id]
+
+    # -------------------------------------------------------------- nav home
+    if data == "nav_home":
+        state["step"] = None
+        text, markup = _build_home(user_id)
+        await query.edit_message_text(
+            text, reply_markup=markup, parse_mode="Markdown"
+        )
+        return
+
+    # ----------------------------------------------------------- toggle mode
+    if data == "toggle_mode":
+        state["mode"] = "AUTO" if state["mode"] == "MANUAL" else "MANUAL"
+        text, markup = _build_home(user_id)
+        await query.edit_message_text(
+            text, reply_markup=markup, parse_mode="Markdown"
+        )
+        return
+
+    # -------------------------------------------------------------- deposit
+    if data == "menu_deposit":
+        addr = _get_active_address(user_id)
+        if not addr:
+            await query.edit_message_text(
+                "No wallet found. Use the Wallets menu to create one.",
+                reply_markup=InlineKeyboardMarkup([_back_button()]),
+            )
+            return
+        net = NETWORKS[state["network"]]
+        text = (
+            f"📥 *Deposit Funds*\n\n"
+            f"Send ETH to your execution wallet:\n"
+            f"`{addr}`\n\n"
+            f"Chain: *{net['name']}*\n"
+            f"Funds arrive instantly and are ready to mint."
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([_back_button()]),
+            parse_mode="Markdown",
+        )
+        return
+
+    # ------------------------------------------------------------ withdraw
+    if data == "menu_withdraw":
+        addr = _get_active_address(user_id)
+        if not addr:
+            await query.edit_message_text(
+                "No wallet found. Create one first.",
+                reply_markup=InlineKeyboardMarkup([_back_button()]),
+            )
+            return
+        net_key = state["network"]
+        bal = get_balance(NETWORKS[net_key]["rpc"], addr)
+        state["step"] = "WITHDRAW_AMOUNT"
+        text = (
+            f"💸 *Withdraw Funds*\n\n"
+            f"Chain: *{NETWORKS[net_key]['name']}*\n"
+            f"Available: `{bal:.4f} ETH`\n\n"
+            f"Enter the amount to withdraw (numbers only):"
+        )
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup([_back_button()]),
+            parse_mode="Markdown",
+        )
+        return
+
+    # -------------------------------------------------------- network picker
+    if data == "menu_network":
+        buttons = []
+        for key, net in NETWORKS.items():
+            marker = "✅ " if state["network"] == key else ""
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{marker}{net['icon']} {net['name']}",
+                    callback_data=f"set_net_{key}",
+                )
+            ])
+        buttons.append(_back_button())
+        await query.edit_message_text(
+            "🌐 *Select Active Chain:*",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("set_net_"):
+        chosen = data.replace("set_net_", "")
+        if chosen in NETWORKS:
+            state["network"] = chosen
+        text, markup = _build_home(user_id)
+        await query.edit_message_text(
+            text, reply_markup=markup, parse_mode="Markdown"
+        )
+        return
+
+    # --------------------------------------------------------- wallet menu
+    if data == "menu_wallets":
+        text = _build_wallet_text(user_id)
+        keyboard = [
+            [
+                InlineKeyboardButton("Create New", callback_data="wallet_create"),
+                InlineKeyboardButton("Import", callback_data="wallet_import"),
+            ],
+            [InlineKeyboardButton("Switch Active", callback_data="wallet_switch")],
+            [InlineKeyboardButton("Reveal Key", callback_data="wallet_reveal")],
+            _back_button(),
+        ]
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "wallet_create":
+        async with user_locks[user_id]:
+            created = db.create_wallet(user_id)
+        state["active_wallet_id"] = created["wallet_id"]
+        msg = await query.message.reply_text(
+            f"{created['label']} created.\n"
+            f"`{created['address']}`\n\n"
+            f"Private key:\n`{created['private_key']}`\n\n"
+            f"Save this now. This message deletes in 5 minutes.",
+            parse_mode="Markdown",
+        )
+        asyncio.create_task(
+            _delete_after(query.message.chat_id, msg.message_id, 300, context)
+        )
+        # Refresh wallet menu
+        text = _build_wallet_text(user_id)
+        keyboard = [
+            [
+                InlineKeyboardButton("Create New", callback_data="wallet_create"),
+                InlineKeyboardButton("Import", callback_data="wallet_import"),
+            ],
+            [InlineKeyboardButton("Switch Active", callback_data="wallet_switch")],
+            [InlineKeyboardButton("Reveal Key", callback_data="wallet_reveal")],
+            _back_button(),
+        ]
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "wallet_import":
+        state["step"] = "IMPORT_KEY"
+        await query.edit_message_text(
+            "🔐 *Import Wallet*\n\n"
+            "Paste the private key you want to import.\n"
+            "Your message will be deleted the moment this bot reads it.",
+            reply_markup=InlineKeyboardMarkup([
+                _back_button("menu_wallets")
+            ]),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "wallet_switch":
+        wallets = db.get_wallets(user_id)
+        if not wallets:
+            await query.edit_message_text(
+                "No wallets yet. Create or import one first.",
+                reply_markup=InlineKeyboardMarkup([_back_button("menu_wallets")]),
+            )
+            return
+        active_id = _get_active_wallet_id(user_id)
+        buttons = []
+        for w in wallets:
+            marker = "✅ " if w["wallet_id"] == active_id else ""
+            buttons.append([
+                InlineKeyboardButton(
+                    f"{marker}{w['label']} [{w['source']}]",
+                    callback_data=f"set_wallet_{w['wallet_id']}",
+                )
+            ])
+        buttons.append(_back_button("menu_wallets"))
+        await query.edit_message_text(
+            "🔐 *Select Active Wallet:*",
+            reply_markup=InlineKeyboardMarkup(buttons),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("set_wallet_"):
+        wid = int(data.replace("set_wallet_", ""))
+        state["active_wallet_id"] = wid
+        text, markup = _build_home(user_id)
+        await query.edit_message_text(
+            text, reply_markup=markup, parse_mode="Markdown"
+        )
+        return
+
+    if data == "wallet_reveal":
+        wallet_id = _get_active_wallet_id(user_id)
+        if not wallet_id:
+            await query.message.reply_text("No wallet selected.")
+            return
+        wallet = db.get_wallet_by_id(wallet_id, user_id)
+        if not wallet:
+            await query.message.reply_text("Wallet not found.")
+            return
+        msg = await query.message.reply_text(
+            f"🔑 *{wallet['label']} Private Key:*\n"
+            f"`{wallet['private_key']}`\n\n"
+            f"This message deletes in 5 minutes.",
+            parse_mode="Markdown",
+        )
+        asyncio.create_task(
+            _delete_after(query.message.chat_id, msg.message_id, 300, context)
+        )
+        return
+
+    # ---------------------------------------------------- copy trade targets
+    if data == "menu_targets":
+        targets = db.get_user_targets(user_id)
+        text = "🎯 *Copy Trade Targets*\n\n"
+        if targets:
+            for i, t in enumerate(targets):
+                connector = "└" if i == len(targets) - 1 else "├"
+                text += f"{connector} `{t}`\n"
+        else:
+            text += "No targets tracked yet.\n"
+        text += "\nPaste a wallet address to add it as a target."
+
+        keyboard = []
+        # Add remove buttons for each target
+        for t in targets:
+            short = t[:6] + "..." + t[-4:]
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🗑 Remove {short}", callback_data=f"rm_target_{t}"
+                )
+            ])
+        state["step"] = "ADD_TARGET"
+        keyboard.append(_back_button())
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("rm_target_"):
+        target = data.replace("rm_target_", "")
+        db.remove_target(user_id, target)
+        # Re-render targets menu
+        targets = db.get_user_targets(user_id)
+        text = "🎯 *Copy Trade Targets*\n\n"
+        if targets:
+            for i, t in enumerate(targets):
+                connector = "└" if i == len(targets) - 1 else "├"
+                text += f"{connector} `{t}`\n"
+        else:
+            text += "No targets tracked yet.\n"
+        text += "\nPaste a wallet address to add it as a target."
+        keyboard = []
+        for t in targets:
+            short = t[:6] + "..." + t[-4:]
+            keyboard.append([
+                InlineKeyboardButton(
+                    f"🗑 Remove {short}", callback_data=f"rm_target_{t}"
+                )
+            ])
+        keyboard.append(_back_button())
+        await query.edit_message_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown",
+        )
+        return
+
+    # --------------------------------------------------- mint flow callbacks
+    if data.startswith("qty_"):
+        context.user_data["selected_qty"] = int(data.split("_")[1])
+        await _refresh_mint_keyboard(query, context)
+        return
+
+    if data.startswith("gas_"):
+        context.user_data["selected_gas"] = int(data.split("_")[1])
+        await _refresh_mint_keyboard(query, context)
+        return
+
+    if data.startswith("price_"):
+        context.user_data["selected_price"] = float(data.split("_")[1])
+        await _refresh_mint_keyboard(query, context)
+        return
+
+    if data == "confirm_mint":
+        contract = context.user_data.get("target_contract")
+        if not contract:
+            await query.edit_message_text("No contract address set. Paste one first.")
+            return
+        qty = context.user_data.get("selected_qty", 1)
+        gas = context.user_data.get("selected_gas", 2)
+        price = context.user_data.get("selected_price", 0.0)
+        await query.edit_message_text(
+            f"⏳ Simulating transaction for `{contract}`...",
+            parse_mode="Markdown",
+        )
+        await _dispatch_mint(
+            user_id, query.message.chat_id, contract, qty, price, gas, context
+        )
+        return
+
+
+# ============================================================================
+# WALLET TEXT BUILDER
+# ============================================================================
+
+def _build_wallet_text(user_id: int) -> str:
+    wallets = db.get_wallets(user_id)
+    active_id = _get_active_wallet_id(user_id)
+    if not wallets:
+        return "🔐 *Wallet Manager*\n\nNo wallets yet. Create or import one."
+
+    lines = ["🔐 *Wallet Manager*", ""]
+    for i, w in enumerate(wallets):
+        marker = " (active)" if w["wallet_id"] == active_id else ""
+        connector = "└" if i == len(wallets) - 1 else "├"
+        lines.append(f"{connector} *{w['label']}* [{w['source']}]{marker}")
+        lines.append(f"  `{w['address']}`")
+    return "\n".join(lines)
+
+
+# ============================================================================
+# MINT KEYBOARD BUILDER & REFRESH
+# ============================================================================
+
+def _build_mint_keyboard(qty: int, gas: int, price: float) -> InlineKeyboardMarkup:
+    keyboard = [
+        [
+            InlineKeyboardButton(f"{'✅ ' if qty == 1 else ''}1", callback_data="qty_1"),
+            InlineKeyboardButton(f"{'✅ ' if qty == 2 else ''}2", callback_data="qty_2"),
+            InlineKeyboardButton(f"{'✅ ' if qty == 5 else ''}5", callback_data="qty_5"),
+        ],
+        [
+            InlineKeyboardButton(f"{'✅ ' if price == 0.0 else ''}Free", callback_data="price_0.0"),
+            InlineKeyboardButton(f"{'✅ ' if price == 0.01 else ''}0.01", callback_data="price_0.01"),
+            InlineKeyboardButton(f"{'✅ ' if price == 0.05 else ''}0.05", callback_data="price_0.05"),
+        ],
+        [
+            InlineKeyboardButton(f"{'✅ ' if gas == 2 else ''}2 Gwei", callback_data="gas_2"),
+            InlineKeyboardButton(f"{'✅ ' if gas == 5 else ''}5 Gwei", callback_data="gas_5"),
+            InlineKeyboardButton(f"{'✅ ' if gas == 10 else ''}10 Gwei", callback_data="gas_10"),
+        ],
         [InlineKeyboardButton("⚡ Confirm & Mint", callback_data="confirm_mint")],
+        _back_button(),
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
-# ============================================================================
-# ONBOARDING COMMANDS
-# ============================================================================
-
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Welcome message shown on first interaction."""
-    await update.message.reply_text(
-        "🤖 *Welcome to the Multi-Chain Minting Suite*\n\n"
-        "This bot gives you a dedicated execution wallet for minting.\n\n"
-        "*Getting Started:*\n"
-        "1. `/wallet` — Create your wallet (private key shown once)\n"
-        "2. `/deposit` — Get your deposit address\n"
-        "3. Fund your wallet, then paste any contract address to mint\n\n"
-        "*Wallet Commands:*\n"
-        "• `/balance` — Check your balance\n"
-        "• `/withdraw <amount> <address>` — Send funds out\n"
-        "• `/deposit` — Show your deposit address\n\n"
-        "*Minting Commands:*\n"
-        "• `/mode` — Toggle AUTO/MANUAL minting\n"
-        "• `/network <name>` — Switch chains (robinhood, arb, base, eth)\n\n"
-        "*Sniper Commands:*\n"
-        "• `/snipe` — Start/Stop mempool sniper\n"
-        "• `/target <address>` — Set copy-trade target wallet\n"
-        "• `/dryrun` — Toggle dry run on/off\n"
-        "• `/status` — View full system status\n\n"
-        "Default network: *Robinhood Chain* (Chain ID 4663).",
-        parse_mode="Markdown",
-    )
-
-
-async def wallet_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Create wallet on first call (shows key once). Repeat calls show address only."""
-    user_id = update.effective_user.id
-    wallet = db.get_or_create_wallet(user_id)
-
-    if not wallet["created"]:
-        # Wallet already exists — show address only, never re-expose the key
-        await update.message.reply_text(
-            f"You already have a wallet:\n`{wallet['address']}`\n\n"
-            f"Your private key was shown once at creation.\n"
-            f"Use `/deposit` to see your address anytime.",
-            parse_mode="Markdown",
-        )
-        return
-
-    # First time — show the key in a self-destructing message
-    msg = await update.message.reply_text(
-        f"🔐 *Your Execution Wallet — Created*\n\n"
-        f"Address:\n`{wallet['address']}`\n\n"
-        f"Private Key:\n`{wallet['private_key']}`\n\n"
-        f"⚠️ *Save this now — this message self-destructs in 5 minutes "
-        f"and the key won't be shown again.*\n"
-        f"Don't keep large amounts here.",
-        parse_mode="Markdown",
-    )
-    # Schedule deletion after 300 seconds (5 minutes)
-    asyncio.create_task(
-        delete_message_task(update.effective_chat.id, msg.message_id, 300, context)
-    )
-
-
-async def deposit_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show deposit address (address-only lookup, no key decryption)."""
-    user_id = update.effective_user.id
-    address = db.get_address(user_id)
-    if not address:
-        await update.message.reply_text(
-            "No wallet found. Use `/wallet` to create one.",
-            parse_mode="Markdown",
-        )
-        return
-    network = user_states[user_id]["network"]
-    await update.message.reply_text(
-        f"📥 *Deposit Address* ({network.upper()}):\n`{address}`",
-        parse_mode="Markdown",
+async def _refresh_mint_keyboard(query, context):
+    qty = context.user_data.get("selected_qty", 1)
+    gas = context.user_data.get("selected_gas", 2)
+    price = context.user_data.get("selected_price", 0.0)
+    await query.edit_message_reply_markup(
+        reply_markup=_build_mint_keyboard(qty, gas, price)
     )
 
 
 # ============================================================================
-# BALANCE, NETWORK, MODE COMMANDS
+# MINT DISPATCHER
 # ============================================================================
 
-async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check balance on the user's active network (address-only, no key needed)."""
-    user_id = update.effective_user.id
-    address = db.get_address(user_id)
-    if not address:
-        await update.message.reply_text(
-            "No wallet found. Use `/wallet` to create one.",
-            parse_mode="Markdown",
-        )
-        return
-
-    network_key = user_states[user_id]["network"]
-    try:
-        bal = get_balance(NETWORKS[network_key], address)
-        await update.message.reply_text(
-            f"📊 Balance on *{network_key.upper()}*:\n`{bal:.4f} ETH`",
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        await update.message.reply_text(f"Error fetching balance: {str(e)}")
-
-
-async def network_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Switch the active chain for this user."""
-    user_id = update.effective_user.id
-    if not context.args:
-        current = user_states[user_id]["network"]
-        available = ", ".join(NETWORKS.keys())
-        await update.message.reply_text(
-            f"Current network: *{current.upper()}*\n"
-            f"Available: {available}\n"
-            f"Usage: `/network <name>`",
-            parse_mode="Markdown",
-        )
-        return
-
-    choice = context.args[0].lower()
-    if choice not in NETWORKS:
-        await update.message.reply_text(
-            f"Unknown network. Available: {', '.join(NETWORKS.keys())}"
-        )
-        return
-
-    user_states[user_id]["network"] = choice
-    await update.message.reply_text(
-        f"Network switched to *{choice.upper()}*",
-        parse_mode="Markdown",
-    )
-
-
-async def mode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle between AUTO and MANUAL minting modes."""
-    user_id = update.effective_user.id
-    state = user_states[user_id]
-    state["mode"] = "AUTO" if state["mode"] == "MANUAL" else "MANUAL"
-    await update.message.reply_text(
-        f"Mint mode switched to: *{state['mode']}*",
-        parse_mode="Markdown",
-    )
-
-
-# ============================================================================
-# WITHDRAW
-# ============================================================================
-
-async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Send ETH from the user's bot wallet to an external address."""
-    user_id = update.effective_user.id
-    wallet = db.get_user_wallet(user_id)  # key genuinely needed — signs a tx
-    if not wallet:
-        await update.message.reply_text(
-            "No wallet found. Use `/wallet` to create one.",
-            parse_mode="Markdown",
-        )
-        return
-
-    if len(context.args) != 2:
-        await update.message.reply_text(
-            "Usage: `/withdraw <amount> <destination_address>`",
-            parse_mode="Markdown",
-        )
-        return
-
-    try:
-        amount = float(context.args[0])
-        to_address = context.args[1]
-    except ValueError:
-        await update.message.reply_text("Invalid amount format.")
-        return
-
-    if not re.match(r"^0x[a-fA-F0-9]{40}$", to_address):
-        await update.message.reply_text("Invalid destination address format.")
-        return
-
-    rpc_url = _get_rpc(user_id)
-    msg = await update.message.reply_text("⏳ Processing withdrawal...")
-
-    async with user_locks[user_id]:
-        loop = asyncio.get_running_loop()
-        try:
-            tx_hash = await loop.run_in_executor(
-                None, execute_withdraw, rpc_url, wallet["private_key"],
-                to_address, amount,
-            )
-            await msg.edit_text(
-                f"✅ *Withdrawal Successful*\nTX: `{tx_hash}`",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            await msg.edit_text(f"❌ *Failed:*\n{str(e)}")
-
-
-# ============================================================================
-# DIRECT MINT (address paste handler + inline buttons)
-# ============================================================================
-
-async def dispatch_mint(
+async def _dispatch_mint(
     user_id: int,
     chat_id: int,
     contract_address: str,
     qty: int,
-    value: float,
-    priority_gwei: int,
+    price: float,
+    gas_gwei: int,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Execute a mint, locked per-user to prevent nonce collisions."""
-    wallet = db.get_user_wallet(user_id)
+    wallet_id = _get_active_wallet_id(user_id)
+    if not wallet_id:
+        await context.bot.send_message(
+            chat_id=chat_id, text="No wallet found. Create one first."
+        )
+        return
+    wallet = db.get_wallet_by_id(wallet_id, user_id)
     if not wallet:
         await context.bot.send_message(
-            chat_id=chat_id,
-            text="No wallet found. Use `/wallet` first.",
-            parse_mode="Markdown",
+            chat_id=chat_id, text="Wallet not found."
         )
         return
 
@@ -399,27 +685,26 @@ async def dispatch_mint(
         loop = asyncio.get_running_loop()
         try:
             tx_hash = await loop.run_in_executor(
-                None,
-                execute_mint,
-                rpc_url,
-                wallet["private_key"],
-                contract_address,
-                qty,
-                value,
-                priority_gwei,
-                max_base_fee,
+                None, execute_mint, rpc_url, wallet["private_key"],
+                contract_address, qty, price, gas_gwei, max_base_fee,
             )
+            net_name = NETWORKS[user_states[user_id]["network"]]["name"]
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"🚀 *Mint Broadcasted*\nTX: `{tx_hash}`",
+                text=(
+                    f"🚀 *Mint Broadcasted*\n\n"
+                    f"Network: *{net_name}*\n"
+                    f"TX: `{tx_hash}`"
+                ),
                 parse_mode="Markdown",
             )
         except RuntimeError as e:
             await context.bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"❌ *Mint Aborted (Simulation Failed)*\n`{str(e)}`\n\n"
-                    f"*No gas was spent.*"
+                    f"❌ *Mint Aborted (Simulation Failed)*\n\n"
+                    f"`{str(e)}`\n\n"
+                    f"No transaction was broadcast. Zero gas spent."
                 ),
                 parse_mode="Markdown",
             )
@@ -432,257 +717,229 @@ async def dispatch_mint(
         except Exception as e:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"🚨 *Broadcast Error*\n`{str(e)}`",
+                text=f"🚨 *Error:*\n`{str(e)}`",
                 parse_mode="Markdown",
             )
 
 
-async def handle_address(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Detect pasted contract addresses and route to mint flow."""
+# ============================================================================
+# TEXT INPUT ROUTER
+# ============================================================================
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
     text = update.message.text.strip()
-    if not re.match(r"^0x[a-fA-F0-9]{40}$", text):
-        return  # Not an address — ignore silently
-
-    user_id = update.effective_user.id
     state = user_states[user_id]
 
-    # Check wallet exists
-    if not db.get_address(user_id):
-        await update.message.reply_text(
-            "No wallet found. Use `/wallet` to create one first.",
-            parse_mode="Markdown",
-        )
-        return
+    # ------------------------------------------------ wallet import flow
+    if state["step"] == "IMPORT_KEY":
+        raw_key = text
+        # Delete the message containing the private key immediately
+        try:
+            await context.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=update.message.message_id,
+            )
+        except Exception:
+            pass
 
-    context.user_data["target_contract"] = text
-
-    if state["mode"] == "AUTO":
-        await update.message.reply_text(
-            f"Auto Mode: Simulating `{text}`...",
-            parse_mode="Markdown",
-        )
-        await dispatch_mint(
-            user_id, update.effective_chat.id, text,
-            state["default_qty"], state["default_value"],
-            state["default_priority_gwei"], context,
-        )
-        return
-
-    # MANUAL mode — show quantity and gas picker
-    context.user_data["selected_qty"] = 1
-    context.user_data["selected_gas"] = 2
-
-    keyboard = build_manual_keyboard(selected_qty=1, selected_gas=2)
-    await update.message.reply_text(
-        f"Contract: `{text}`\nChoose quantity and gas below, then confirm:",
-        reply_markup=keyboard,
-        parse_mode="Markdown",
-    )
-
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle inline button clicks for manual mint flow."""
-    query = update.callback_query
-    await query.answer()
-    user_id = update.effective_user.id
-    data = query.data
-
-    qty = context.user_data.get("selected_qty", 1)
-    gas = context.user_data.get("selected_gas", 2)
-
-    if data.startswith("qty_"):
-        qty = int(data.split("_")[1])
-        context.user_data["selected_qty"] = qty
-        await query.edit_message_reply_markup(
-            reply_markup=build_manual_keyboard(qty, gas)
-        )
-
-    elif data.startswith("gas_"):
-        gas = int(data.split("_")[1])
-        context.user_data["selected_gas"] = gas
-        await query.edit_message_reply_markup(
-            reply_markup=build_manual_keyboard(qty, gas)
-        )
-
-    elif data == "confirm_mint":
-        contract = context.user_data.get("target_contract")
-        if not contract:
-            await query.edit_message_text("No contract address set. Paste one first.")
+        state["step"] = None
+        try:
+            result = db.import_wallet(user_id, raw_key)
+        except Exception:
+            await update.effective_chat.send_message(
+                "That does not look like a valid private key. Import cancelled."
+            )
             return
-        await query.edit_message_text(
-            f"⏳ Simulating and broadcasting for `{contract}`...",
-            parse_mode="Markdown",
-        )
-        await dispatch_mint(
-            user_id, update.effective_chat.id, contract, qty, 0.0, gas, context
-        )
 
+        if result["already_existed"]:
+            await update.effective_chat.send_message(
+                f"Already imported as {result['label']}.\n`{result['address']}`",
+                parse_mode="Markdown",
+            )
+        else:
+            state["active_wallet_id"] = result["wallet_id"]
+            await update.effective_chat.send_message(
+                f"Imported as {result['label']}.\n"
+                f"`{result['address']}`\n\n"
+                f"The message with your key has been removed from this chat.",
+                parse_mode="Markdown",
+            )
+        return
 
-# ============================================================================
-# SNIPER COMMANDS
-# ============================================================================
+    # ------------------------------------------ withdrawal wizard: amount
+    if state["step"] == "WITHDRAW_AMOUNT":
+        # Numbers only validation
+        if not re.match(r"^\d+\.?\d*$", text):
+            await update.message.reply_text(
+                "Numbers only. Enter a valid amount (e.g. 0.05):"
+            )
+            return
 
-async def toggle_snipe_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start or stop the mempool sniper for this user."""
-    user_id = update.effective_user.id
-    state = user_states[user_id]
+        amt = float(text)
+        if amt <= 0:
+            await update.message.reply_text(
+                "Amount must be greater than zero. Try again:"
+            )
+            return
 
-    if not db.get_address(user_id):
+        state["withdraw_amount"] = amt
+        state["step"] = "WITHDRAW_ADDRESS"
         await update.message.reply_text(
-            "No wallet found. Use `/wallet` to create one first.",
+            f"Amount: `{amt} ETH`\n\nNow paste the destination address:",
             parse_mode="Markdown",
         )
         return
 
-    state["sniper_active"] = not state["sniper_active"]
-
-    if state["sniper_active"]:
-        target = state["target_wallet"]
-        if not target or not re.match(r"^0x[a-fA-F0-9]{40}$", target):
-            state["sniper_active"] = False
+    # ---------------------------------------- withdrawal wizard: address
+    if state["step"] == "WITHDRAW_ADDRESS":
+        if not re.match(r"^0x[a-fA-F0-9]{40}$", text):
             await update.message.reply_text(
-                "❌ Set a valid target wallet first: `/target 0x...`",
+                "Invalid address format. Paste a valid 0x address:"
+            )
+            return
+
+        to_addr = text
+        amt = state["withdraw_amount"]
+        state["step"] = None
+
+        wallet_id = _get_active_wallet_id(user_id)
+        wallet = db.get_wallet_by_id(wallet_id, user_id) if wallet_id else None
+        if not wallet:
+            await update.message.reply_text("No wallet found.")
+            return
+
+        rpc_url = _get_rpc(user_id)
+        msg = await update.message.reply_text(
+            f"⏳ Broadcasting withdrawal of `{amt} ETH`...",
+            parse_mode="Markdown",
+        )
+
+        async with user_locks[user_id]:
+            loop = asyncio.get_running_loop()
+            try:
+                tx_hash = await loop.run_in_executor(
+                    None, execute_withdraw, rpc_url,
+                    wallet["private_key"], to_addr, amt,
+                )
+                await msg.edit_text(
+                    f"✅ *Withdrawal Confirmed*\nTX: `{tx_hash}`",
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                await msg.edit_text(
+                    f"❌ *Withdrawal Failed:*\n`{str(e)}`",
+                    parse_mode="Markdown",
+                )
+        return
+
+    # ------------------------------------------- add target flow
+    if state["step"] == "ADD_TARGET":
+        if re.match(r"^0x[a-fA-F0-9]{40}$", text):
+            db.add_target(user_id, text)
+            state["step"] = None
+            await update.message.reply_text(
+                f"🎯 Target added: `{text}`",
                 parse_mode="Markdown",
             )
             return
-        if not WS_RPC:
-            state["sniper_active"] = False
+        # Not an address while in target mode, ignore silently
+        return
+
+    # ------------------------------------------- contract address (mint)
+    if re.match(r"^0x[a-fA-F0-9]{40}$", text):
+        addr = _get_active_address(user_id)
+        if not addr:
             await update.message.reply_text(
-                "❌ No WS_RPC configured in .env. Sniper requires a WebSocket endpoint.",
+                "No wallet found. Use /start to create one."
             )
             return
-        state["sniper_task"] = asyncio.create_task(
-            mempool_worker(user_id, update.effective_chat.id, context.application)
-        )
+
+        context.user_data["target_contract"] = text
+        rpc_url = _get_rpc(user_id)
+
+        # Auto-detect mint price from contract
+        detected = detect_mint_price(rpc_url, text) or 0.0
+        context.user_data["selected_qty"] = 1
+        context.user_data["selected_gas"] = 2
+        context.user_data["selected_price"] = detected
+
+        if state["mode"] == "AUTO":
+            await update.message.reply_text(
+                f"⚡ Auto Mode: simulating mint for `{text}` "
+                f"at `{detected} ETH` per token...",
+                parse_mode="Markdown",
+            )
+            await _dispatch_mint(
+                user_id, update.effective_chat.id,
+                text, 1, detected, 2, context,
+            )
+            return
+
+        # MANUAL mode: show mint config keyboard
+        net_name = NETWORKS[state["network"]]["name"]
         await update.message.reply_text(
-            "🚀 *Sniper Activated!* Listening for target transactions...",
-            parse_mode="Markdown",
-        )
-    else:
-        task = state.get("sniper_task")
-        if task and not task.done():
-            task.cancel()
-        await update.message.reply_text(
-            "🛑 *Sniper Deactivated.*",
-            parse_mode="Markdown",
-        )
-
-
-async def set_target_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Set the wallet address to copy-trade from."""
-    user_id = update.effective_user.id
-    state = user_states[user_id]
-
-    if not context.args:
-        current = state["target_wallet"] or "None set"
-        await update.message.reply_text(
-            f"Current target: `{current}`\n\nUsage: `/target 0x1234...`",
-            parse_mode="Markdown",
-        )
-        return
-
-    new_target = context.args[0].strip().lower()
-    if not re.match(r"^0x[a-fA-F0-9]{40}$", new_target):
-        await update.message.reply_text("❌ Invalid EVM address format.")
-        return
-
-    state["target_wallet"] = new_target
-    await update.message.reply_text(
-        f"🎯 Target wallet updated to:\n`{state['target_wallet']}`",
-        parse_mode="Markdown",
-    )
-
-
-async def toggle_dryrun_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle dry-run mode for the sniper."""
-    user_id = update.effective_user.id
-    state = user_states[user_id]
-    state["dry_run"] = not state["dry_run"]
-    await update.message.reply_text(
-        f"Dry Run mode set to: *{state['dry_run']}*",
-        parse_mode="Markdown",
-    )
-
-
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Show full status for this user — wallet, balance, sniper, etc."""
-    user_id = update.effective_user.id
-    address = db.get_address(user_id)
-    state = user_states[user_id]
-    network_key = state["network"]
-
-    if not address:
-        await update.message.reply_text(
-            "No wallet found. Use `/wallet` to create one.",
+            f"🎯 *Mint Configuration*\n\n"
+            f"Contract: `{text}`\n"
+            f"Detected Price: `{detected} ETH`\n"
+            f"Network: *{net_name}*\n\n"
+            f"Configure and confirm:",
+            reply_markup=_build_mint_keyboard(1, 2, detected),
             parse_mode="Markdown",
         )
         return
-
-    try:
-        bal = get_balance(NETWORKS[network_key], address)
-        bal_str = f"{bal:.4f} ETH"
-    except Exception:
-        bal_str = "Error fetching"
-
-    await update.message.reply_text(
-        f"📊 *System Status*\n\n"
-        f"• Wallet: `{address}`\n"
-        f"• Network: *{network_key.upper()}*\n"
-        f"• Balance: `{bal_str}`\n"
-        f"• Mint Mode: *{state['mode']}*\n"
-        f"• Sniper Active: *{state['sniper_active']}*\n"
-        f"• Sniper Dry Run: *{state['dry_run']}*\n"
-        f"• Target Wallet: `{state['target_wallet'] or 'None set'}`\n"
-        f"• Sniper Stats: {state['successful_copies']} ok / "
-        f"{state['failed_copies']} failed\n"
-        f"• Daily Spent: `{state['daily_spent_eth']:.4f} / "
-        f"{state['daily_limit_eth']} ETH`",
-        parse_mode="Markdown",
-    )
 
 
 # ============================================================================
-# MEMPOOL SNIPER BACKGROUND WORKER (per-user)
+# MEMPOOL SNIPER (per-user background worker)
 # ============================================================================
 
 async def mempool_worker(user_id: int, chat_id: int, app):
-    """
-    WebSocket listener for a user's target wallet.
-    Runs as a background task per-user.
-    """
+    """WebSocket listener for a user's target wallets."""
     from websockets import connect
 
     state = user_states[user_id]
+    net_key = state["network"]
+    ws_url = NETWORKS[net_key].get("ws", "")
+
+    if not ws_url:
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text=f"No WebSocket RPC configured for {net_key.upper()}. Sniper cannot start.",
+        )
+        state["sniper_active"] = False
+        return
+
+    targets = db.get_user_targets(user_id)
+    if not targets:
+        await app.bot.send_message(
+            chat_id=chat_id,
+            text="No targets tracked. Add targets from the Copy Trade menu first.",
+        )
+        state["sniper_active"] = False
+        return
 
     while state["sniper_active"]:
         try:
-            target = state["target_wallet"]
-            if not target or not target.startswith("0x") or len(target) != 42:
-                await app.bot.send_message(
-                    chat_id=chat_id,
-                    text="⚠️ *Sniper paused:* Invalid target wallet.",
-                    parse_mode="Markdown",
-                )
-                state["sniper_active"] = False
-                break
-
-            async with connect(WS_RPC) as ws:
+            async with connect(ws_url) as ws:
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0",
                     "id": 1,
                     "method": "eth_subscribe",
                     "params": [
                         "alchemy_pendingTransactions",
-                        {"fromAddress": [target]},
+                        {"fromAddress": targets},
                     ],
                 }))
 
                 await ws.recv()  # subscription confirmation
+                target_list = ", ".join(t[:8] + "..." for t in targets)
                 await app.bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🎯 *Mempool Sniper Listening*\n"
-                        f"Target: `{target}`\n"
+                        f"🎯 *Sniper Listening*\n\n"
+                        f"Targets: {target_list}\n"
+                        f"Chain: *{net_key.upper()}*\n"
                         f"Mode: `{'DRY RUN' if state['dry_run'] else 'LIVE'}`"
                     ),
                     parse_mode="Markdown",
@@ -695,10 +952,9 @@ async def mempool_worker(user_id: int, chat_id: int, app):
                         continue
 
                     tx_data = msg["params"]["result"]
-                    # Alchemy can return full tx object or just a hash
-                    from web3 import Web3
+                    from web3 import Web3 as W3
                     if isinstance(tx_data, str):
-                        w3 = Web3(Web3.HTTPProvider(_get_rpc(user_id)))
+                        w3 = W3(W3.HTTPProvider(_get_rpc(user_id)))
                         tx = w3.eth.get_transaction(tx_data)
                     else:
                         tx = tx_data
@@ -723,38 +979,36 @@ async def mempool_worker(user_id: int, chat_id: int, app):
                         continue
 
                     qty = parse_mint_quantity(input_data, func_sig)
-                    val_eth = float(Web3.from_wei(int(tx.get("value", 0)), "ether"))
+                    val_eth = float(W3.from_wei(int(tx.get("value", 0)), "ether"))
 
-                    # Check daily limit
                     if not _check_daily_limit(user_id, val_eth):
                         await app.bot.send_message(
                             chat_id=chat_id,
                             text=(
-                                f"⚠️ *Sniper Skip:* Daily limit would be exceeded "
-                                f"({state['daily_spent_eth']:.4f}/{state['daily_limit_eth']} ETH)"
+                                f"⚠️ Daily limit would be exceeded "
+                                f"({state['daily_spent_eth']:.4f}/"
+                                f"{state['daily_limit_eth']} ETH). Skipping."
                             ),
-                            parse_mode="Markdown",
                         )
                         continue
 
                     await app.bot.send_message(
                         chat_id=chat_id,
                         text=(
-                            f"🎯 *Target Mint Detected in Mempool!*\n"
-                            f"Target: `{target}`\n"
+                            f"🎯 *Mint Detected*\n\n"
                             f"Contract: `{tx.get('to')}`\n"
-                            f"Qty: `{qty}` | Val: `{val_eth} ETH`\n"
+                            f"Qty: `{qty}` | Value: `{val_eth} ETH`\n"
                             f"Executing copy..."
                         ),
                         parse_mode="Markdown",
                     )
 
-                    # Execute copy mint
-                    wallet = db.get_user_wallet(user_id)
+                    wallet_id = _get_active_wallet_id(user_id)
+                    wallet = db.get_wallet_by_id(wallet_id, user_id) if wallet_id else None
                     if not wallet:
                         await app.bot.send_message(
                             chat_id=chat_id,
-                            text="❌ Wallet not found. Cannot execute copy mint.",
+                            text="Wallet not found. Cannot execute.",
                         )
                         continue
 
@@ -764,14 +1018,10 @@ async def mempool_worker(user_id: int, chat_id: int, app):
                         loop = asyncio.get_running_loop()
                         try:
                             result = await loop.run_in_executor(
-                                None,
-                                execute_copy_mint,
-                                rpc_url,
-                                wallet["private_key"],
-                                tx.get("to"),
-                                input_data,
-                                qty,
-                                val_eth,
+                                None, execute_copy_mint,
+                                rpc_url, wallet["private_key"],
+                                tx.get("to"), input_data,
+                                qty, val_eth,
                                 tx.get("gasPrice"),
                                 tx.get("maxFeePerGas"),
                                 tx.get("maxPriorityFeePerGas"),
@@ -782,19 +1032,17 @@ async def mempool_worker(user_id: int, chat_id: int, app):
                             )
                             state["successful_copies"] += 1
                             if not state["dry_run"]:
-                                # Track spend only on live trades
-                                # (approximation — actual spend calculated inside engine)
                                 state["daily_spent_eth"] += val_eth
                             await app.bot.send_message(
                                 chat_id=chat_id,
-                                text=f"✅ *Sniper Result:*\n`{result}`",
+                                text=f"✅ *Result:*\n`{result}`",
                                 parse_mode="Markdown",
                             )
                         except Exception as e:
                             state["failed_copies"] += 1
                             await app.bot.send_message(
                                 chat_id=chat_id,
-                                text=f"❌ *Sniper Failed:*\n`{str(e)}`",
+                                text=f"❌ *Failed:*\n`{str(e)}`",
                                 parse_mode="Markdown",
                             )
 
@@ -812,28 +1060,13 @@ async def mempool_worker(user_id: int, chat_id: int, app):
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Onboarding
+    # Entry points (only two commands needed)
     app.add_handler(CommandHandler("start", start_cmd))
-    app.add_handler(CommandHandler("wallet", wallet_cmd))
-    app.add_handler(CommandHandler("deposit", deposit_cmd))
+    app.add_handler(CommandHandler("home", start_cmd))
 
-    # Wallet operations
-    app.add_handler(CommandHandler("balance", balance_cmd))
-    app.add_handler(CommandHandler("withdraw", withdraw_cmd))
-
-    # Network & mode
-    app.add_handler(CommandHandler("network", network_cmd))
-    app.add_handler(CommandHandler("mode", mode_cmd))
-
-    # Sniper
-    app.add_handler(CommandHandler("snipe", toggle_snipe_cmd))
-    app.add_handler(CommandHandler("target", set_target_cmd))
-    app.add_handler(CommandHandler("dryrun", toggle_dryrun_cmd))
-    app.add_handler(CommandHandler("status", status_cmd))
-
-    # Address paste + inline buttons
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_address))
+    # Everything else is buttons or text input
     app.add_handler(CallbackQueryHandler(handle_callback))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
     app.run_polling()
 
