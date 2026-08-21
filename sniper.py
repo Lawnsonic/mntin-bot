@@ -283,9 +283,20 @@ async def _stream_chain(
                     # Case A: newHeads block message -> scan all txs in block
                     if sub_id == sub_heads and isinstance(res, dict) and "number" in res:
                         block_num = int(res["number"], 16)
-                        # Fetch full block asynchronously
+                        # Fetch full block asynchronously. The WS node can announce a
+                        # block slightly before the HTTP RPC node has it indexed, so retry
+                        # briefly instead of dropping the block outright.
+                        block = None
+                        for attempt in range(3):
+                            try:
+                                block = await asyncio.to_thread(w3.eth.get_block, block_num, full_transactions=True)
+                                break
+                            except Exception as e:
+                                if attempt < 2:
+                                    await asyncio.sleep(0.2 * (attempt + 1))
+                                else:
+                                    print(f"[{chain_key}] Block fetch/scan failed for block {block_num} after 3 attempts: {e}")
                         try:
-                            block = await asyncio.to_thread(w3.eth.get_block, block_num, full_transactions=True)
                             active_targets = set(db.get_all_active_targets().keys())
                             if active_targets and block and block.transactions:
                                 for tx in block.transactions:
@@ -301,7 +312,7 @@ async def _stream_chain(
                                             _handle_target_tx(chain_key, http_rpc, tx, user_states, user_locks, tg_bot)
                                         )
                         except Exception as e:
-                            print(f"[{chain_key}] Block fetch/scan failed for block {block_num}: {e}")
+                            print(f"[{chain_key}] Block scan (post-fetch) failed for block {block_num}: {e}")
 
                     # Case B: alchemy_pendingTransactions message
                     elif sub_id == sub_pending:
