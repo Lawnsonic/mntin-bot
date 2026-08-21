@@ -375,13 +375,13 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Welcome to Mntin Bot. {created['label']} has been created.\n\n"
             f"`{created['address']}`\n\n"
             f"Private key:\n`{created['private_key']}`\n\n"
-            f"Save this now. This message deletes in 5 minutes "
+            f"Save this now. This message deletes in 2 minutes "
             f"and the key will not be shown again here.\n"
             f"Use the Wallets menu to import or create more.",
             parse_mode="Markdown",
         )
         asyncio.create_task(
-            _delete_after(chat_id, msg.message_id, 300, context)
+            _delete_after(chat_id, msg.message_id, 120, context)
         )
 
     await _send_home(user_id, chat_id, context, via_message=True, update=update, force_refresh=True)
@@ -722,11 +722,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{created['label']} created.\n"
             f"`{created['address']}`\n\n"
             f"Private key:\n`{created['private_key']}`\n\n"
-            f"Save this now. This message deletes in 5 minutes.",
+            f"Save this now. This message deletes in 2 minutes.",
             parse_mode="Markdown",
         )
         asyncio.create_task(
-            _delete_after(query.message.chat_id, msg.message_id, 300, context)
+            _delete_after(query.message.chat_id, msg.message_id, 120, context)
         )
         # Refresh wallet menu on the existing message
         text = _build_wallet_text(user_id)
@@ -806,11 +806,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = await query.message.reply_text(
             f"\U0001f511 *{wallet['label']} Private Key:*\n"
             f"`{wallet['private_key']}`\n\n"
-            f"This message deletes in 5 minutes.",
+            f"This message deletes in 30 seconds.",
             parse_mode="Markdown",
         )
         asyncio.create_task(
-            _delete_after(query.message.chat_id, msg.message_id, 300, context)
+            _delete_after(query.message.chat_id, msg.message_id, 30, context)
         )
         return
 
