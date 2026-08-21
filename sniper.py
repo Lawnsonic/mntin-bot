@@ -2,7 +2,9 @@
 sniper.py. Multi-chain, multi-target, multi-user copy-mint listener.
 
 Covers Robinhood Chain, Arbitrum, Base, and Ethereum via low-latency
-Alchemy WebSocket connections.
+dual-stream WebSocket connections:
+  1. newHeads: Instantly scans blocks (250ms-1s) for mined L2/L3 transactions (Orbit/Robinhood, Base, Arbitrum).
+  2. alchemy_pendingTransactions: Catches pre-inclusion mempool transactions (Ethereum L1, public mempools).
 
 Runs as background asyncio tasks inside the bot process, sharing db.py,
 user_locks, and each user's live settings in bot.py's user_states.
@@ -13,6 +15,7 @@ import asyncio
 import json
 import os
 import time
+from typing import Dict, List, Set
 
 from web3 import Web3
 from dotenv import load_dotenv
@@ -29,7 +32,7 @@ CHAINS = {
     "eth": {"http": os.getenv("ETH_RPC"), "ws": os.getenv("ETH_WS_RPC")},
 }
 
-_seen_txs: set = set()
+_seen_txs: Set[str] = set()
 
 
 def _mark_seen(tx_hash: str) -> bool:
@@ -37,7 +40,7 @@ def _mark_seen(tx_hash: str) -> bool:
     if tx_hash in _seen_txs:
         return True
     _seen_txs.add(tx_hash)
-    if len(_seen_txs) > 20000:
+    if len(_seen_txs) > 30000:
         _seen_txs.clear()
     return False
 
@@ -99,7 +102,8 @@ async def _handle_target_tx(
 
         state = user_states[user_id]
         state["daily_limit_eth"] = settings.get("daily_limit_eth", 0.05)
-        chat_id = state.get("chat_id", user_id)
+        # In Telegram 1-on-1 chats, chat_id is always equal to user_id
+        chat_id = state.get("chat_id") or user_id
 
         wallet_id = state.get("active_wallet_id")
         wallet = db.get_wallet_by_id(wallet_id, user_id) if wallet_id else None
@@ -200,44 +204,79 @@ async def _stream_chain(
     user_locks: dict,
     tg_bot=None,
 ):
-    """Subscribe to pending transactions on one chain and process matches."""
+    """
+    Dual-stream listener for one chain:
+      - newHeads: Scans every newly mined block (250ms on Robinhood/Arbitrum/Base)
+      - alchemy_pendingTransactions: Catches pending mempool transactions
+    """
     from websockets import connect
+    w3 = get_w3(http_rpc)
 
     while True:
         try:
             async with connect(ws_url, ping_timeout=15) as ws:
-                addresses = list(db.get_all_active_targets().keys())
-                if not addresses:
-                    await asyncio.sleep(5)
-                    continue
-
+                # 1. Subscribe to newHeads (block level stream)
                 await ws.send(json.dumps({
                     "jsonrpc": "2.0", "id": 1, "method": "eth_subscribe",
-                    "params": ["alchemy_pendingTransactions", {"fromAddress": addresses}],
+                    "params": ["newHeads"],
                 }))
-                await ws.recv()  # subscription confirmation
-                print(f"[{chain_key}] Sniper subscribed to {len(addresses)} target(s)")
+                sub_heads = json.loads(await ws.recv()).get("result")
+
+                # 2. Subscribe to pending transactions for tracked targets
+                addresses = list(db.get_all_active_targets().keys())
+                sub_pending = None
+                if addresses:
+                    await ws.send(json.dumps({
+                        "jsonrpc": "2.0", "id": 2, "method": "eth_subscribe",
+                        "params": ["alchemy_pendingTransactions", {"fromAddress": addresses}],
+                    }))
+                    sub_pending = json.loads(await ws.recv()).get("result")
+
+                print(f"[{chain_key}] Sniper active. Watching blocks & {len(addresses)} target(s)")
 
                 last_refresh = time.time()
                 while True:
-                    msg = json.loads(await ws.recv())
-                    if "params" in msg and "result" in msg["params"]:
-                        tx_data = msg["params"]["result"]
-                        if isinstance(tx_data, dict):
-                            tx = tx_data
+                    raw = await ws.recv()
+                    msg = json.loads(raw)
+                    if "params" not in msg or "result" not in msg["params"]:
+                        continue
+
+                    sub_id = msg["params"].get("subscription")
+                    res = msg["params"]["result"]
+
+                    # Case A: newHeads block message -> scan all txs in block
+                    if sub_id == sub_heads and isinstance(res, dict) and "number" in res:
+                        block_num = int(res["number"], 16)
+                        # Fetch full block asynchronously
+                        try:
+                            block = await asyncio.to_thread(w3.eth.get_block, block_num, full_transactions=True)
+                            active_targets = set(db.get_all_active_targets().keys())
+                            if active_targets and block and block.transactions:
+                                for tx in block.transactions:
+                                    from_addr = (tx.get("from") or "").lower()
+                                    if from_addr in active_targets:
+                                        asyncio.create_task(
+                                            _handle_target_tx(chain_key, http_rpc, tx, user_states, user_locks, tg_bot)
+                                        )
+                        except Exception as e:
+                            pass
+
+                    # Case B: alchemy_pendingTransactions message
+                    elif sub_id == sub_pending:
+                        if isinstance(res, dict):
+                            tx = res
                         else:
-                            tx = get_w3(http_rpc).eth.get_transaction(tx_data)
+                            tx = await asyncio.to_thread(w3.eth.get_transaction, res)
+                        if tx:
+                            asyncio.create_task(
+                                _handle_target_tx(chain_key, http_rpc, tx, user_states, user_locks, tg_bot)
+                            )
 
-                        # Non-blocking dispatch to keep WebSocket receive loop responsive
-                        asyncio.create_task(
-                            _handle_target_tx(chain_key, http_rpc, tx, user_states, user_locks, tg_bot)
-                        )
-
-                    # Re-subscribe every 60s to pick up newly added targets
+                    # Re-subscribe every 60s to refresh tracked target list
                     if time.time() - last_refresh > 60:
                         break
         except Exception as e:
-            print(f"[{chain_key}] WebSocket error, reconnecting in 3s: {e}")
+            print(f"[{chain_key}] WebSocket disconnected, reconnecting in 3s: {e}")
             await asyncio.sleep(3)
 
 
