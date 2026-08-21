@@ -500,9 +500,23 @@ def execute_copy_mint(
             gas_price = w3.eth.gas_price
         tx_data["gasPrice"] = min(gas_price, w3.to_wei(max_base_fee_gwei, "gwei"))
 
-    # Simulate
+    # Simulate. Estimate using the *real* base fee, not the bumped
+    # maxFeePerGas we intend to sign with — many nodes check wallet
+    # affordability during eth_estimateGas using whatever fee field is
+    # already on the tx, so a large bump (e.g. 2.5x base fee) can trip a
+    # false "insufficient funds for transfer" even when the wallet can
+    # easily cover the real gas cost. The actual bumped fee is restored
+    # below, after estimation succeeds, for the transaction we sign.
+    estimate_tx = dict(tx_data)
+    if "maxFeePerGas" in estimate_tx:
+        estimate_tx["maxFeePerGas"] = latest_block.get("baseFeePerGas", 0) + estimate_tx.get(
+            "maxPriorityFeePerGas", 0
+        )
+    elif "gasPrice" in estimate_tx:
+        estimate_tx["gasPrice"] = w3.eth.gas_price
+
     try:
-        estimated = w3.eth.estimate_gas(tx_data)
+        estimated = w3.eth.estimate_gas(estimate_tx)
         tx_data["gas"] = int(estimated * 1.25)
     except ContractLogicError as sim_err:
         raise RuntimeError(f"Simulation failed (tx would revert): {sim_err}") from sim_err
