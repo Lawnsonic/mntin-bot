@@ -13,6 +13,7 @@ import re
 import json
 import asyncio
 import time
+import logging
 from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Optional, Set
@@ -41,6 +42,8 @@ from mint_engine import (
 from robinhood_sniper import prepare_mint_tx, wait_for_mint_open, broadcast_via_all
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # ============================================================================
 # CONFIGURATION
@@ -801,9 +804,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"\U0001f552 *FCFS Sniper Armed*\n\n"
             f"Contract: `{contract}`\n"
-            f"Monitoring for bytecode deployment.\n"
-            f"Transaction is pre-signed and will blast via "
-            f"{len(ROBINHOOD_RPCS)} RPC(s) the moment the contract is live.\n\n"
+            f"Monitoring for bytecode deployment across {len(ROBINHOOD_RPCS)} RPC(s).\n"
+            f"Transaction is pre-signed and will blast the moment the contract is live.\n\n"
+            f"\u26a0\ufe0f *Warning:* Uses wallet balance/nonce at armed time - do not send other transactions from this wallet before it fires.\n\n"
             f"Timeout: 10 minutes.",
             parse_mode="Markdown",
         )
@@ -867,6 +870,9 @@ def _build_sniper_keyboard(user_id: int) -> InlineKeyboardMarkup:
     """Sniper control panel with toggles, gas bump presets, and per-target remove buttons."""
     state = user_states[user_id]
     targets = db.get_user_targets(user_id)
+    bump = state["gas_bump_percent"]
+    is_custom = bump not in (30, 50)
+    custom_label = f"\u2705 {bump}%" if is_custom else "Custom"
 
     keyboard = [
         [
@@ -881,14 +887,14 @@ def _build_sniper_keyboard(user_id: int) -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(
-                f"{'\u2705 ' if state['gas_bump_percent'] == 30 else ''}30%",
+                f"{'\u2705 ' if bump == 30 else ''}30%",
                 callback_data="set_bump_30",
             ),
             InlineKeyboardButton(
-                f"{'\u2705 ' if state['gas_bump_percent'] == 50 else ''}50%",
+                f"{'\u2705 ' if bump == 50 else ''}50%",
                 callback_data="set_bump_50",
             ),
-            InlineKeyboardButton("Custom", callback_data="set_bump_custom"),
+            InlineKeyboardButton(custom_label, callback_data="set_bump_custom"),
         ],
     ]
 
@@ -1035,7 +1041,7 @@ async def _dispatch_rbh_sniper(
     price: float,
     context: ContextTypes.DEFAULT_TYPE,
 ):
-    """Background task: pre-sign, wait for deploy, blast."""
+    """Background task: pre-sign, wait for deploy across all RPCs, blast."""
     wallet_id = _get_active_wallet_id(user_id)
     wallet = db.get_wallet_by_id(wallet_id, user_id)
     if not wallet:
@@ -1053,8 +1059,8 @@ async def _dispatch_rbh_sniper(
             contract_address, qty, price,
         )
 
-        # Block until contract is live (10 min timeout)
-        is_live = await wait_for_mint_open(rpc_url, contract_address)
+        # Block until contract is live (10 min timeout) across all Robinhood RPCs
+        is_live = await wait_for_mint_open(ROBINHOOD_RPCS, contract_address)
 
         if is_live:
             tx_hash = await broadcast_via_all(ROBINHOOD_RPCS, tx_payload["raw"])
@@ -1074,9 +1080,10 @@ async def _dispatch_rbh_sniper(
                 parse_mode="Markdown",
             )
     except Exception as e:
+        logger.exception("FCFS sniper failed for user %s, contract %s", user_id, contract_address)
         await context.bot.send_message(
             chat_id=chat_id,
-            text=f"\U0001f6a8 *Sniper Error:*\n`{str(e)}`",
+            text=f"\U0001f6a8 *Sniper Error*\n`{str(e)}`",
             parse_mode="Markdown",
         )
 
@@ -1144,23 +1151,34 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ---------------------------------------- custom gas bump input
     if state["step"] == "AWAITING_CUSTOM_BUMP":
-        if not re.match(r"^\d+$", text):
-            await update.message.reply_text(
-                "Invalid percentage. Enter a positive whole number (e.g. 75):"
+        # Delete user's numeric input immediately to keep chat clean
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=update.message.message_id,
             )
-            return
-        bump = int(text)
-        if bump < 0:
-            await update.message.reply_text("Must be a positive number.")
-            return
-        state["gas_bump_percent"] = bump
-        state["step"] = "ADD_TARGET"
-        db.update_sniper_settings(user_id, gas_bump_percent=bump)
-        await _update_menu_message(
-            user_id, chat_id, context,
-            _build_sniper_text(user_id),
-            _build_sniper_keyboard(user_id),
-        )
+        except Exception:
+            pass
+
+        try:
+            bump = int(text)
+            if not 0 <= bump <= 500:
+                raise ValueError
+
+            state["gas_bump_percent"] = bump
+            state["step"] = "ADD_TARGET"
+            db.update_sniper_settings(user_id, gas_bump_percent=bump)
+
+            await _update_menu_message(
+                user_id, chat_id, context,
+                _build_sniper_text(user_id),
+                _build_sniper_keyboard(user_id),
+            )
+        except ValueError:
+            err = await update.message.reply_text(
+                "Invalid percentage. Enter a whole number between 0 and 500."
+            )
+            asyncio.create_task(_delete_after(chat_id, err.message_id, 5, context))
         return
 
     # ------------------------------------------ withdrawal wizard: amount

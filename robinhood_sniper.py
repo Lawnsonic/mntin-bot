@@ -53,16 +53,17 @@ def prepare_mint_tx(
     return {"raw": signed.raw_transaction, "hash": w3.to_hex(signed.hash)}
 
 
+def _send_one(rpc_url: str, raw_tx: bytes):
+    return get_w3(rpc_url).eth.send_raw_transaction(raw_tx)
+
+
 async def broadcast_via_all(rpc_urls: List[str], raw_tx: bytes) -> str:
     """
     Fire the pre-signed payload at multiple RPC nodes concurrently.
     Returns the tx hash from whichever node accepts it first.
     """
-    def send_one(rpc_url):
-        return get_w3(rpc_url).eth.send_raw_transaction(raw_tx)
-
     tasks = [
-        asyncio.create_task(asyncio.to_thread(send_one, u))
+        asyncio.create_task(asyncio.to_thread(_send_one, u, raw_tx))
         for u in rpc_urls
     ]
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -73,25 +74,40 @@ async def broadcast_via_all(rpc_urls: List[str], raw_tx: bytes) -> str:
     return Web3.to_hex(list(done)[0].result())
 
 
+async def _poll_one(rpc_url: str, checksum: str, poll_interval: float, deadline: float) -> bool:
+    """Poll a single RPC node for bytecode, ignoring transient network/RPC glitches."""
+    w3 = get_w3(rpc_url)
+    while time.time() < deadline:
+        try:
+            code = await asyncio.to_thread(w3.eth.get_code, checksum)
+            if code not in (b"", b"\x00"):
+                return True
+        except Exception:
+            pass  # Transient RPC hiccup; keep polling
+        await asyncio.sleep(poll_interval)
+    return False
+
+
 async def wait_for_mint_open(
-    rpc_url: str,
+    rpc_urls: List[str],
     contract_address: str,
     poll_interval: float = 0.25,
     timeout: float = 600,
 ) -> bool:
     """
-    Poll for contract bytecode to appear (stealth drop detection).
-    Returns True when bytecode is found, False on timeout.
-    The 250ms interval balances latency vs RPC rate limits.
+    Poll all RPC nodes concurrently for contract bytecode to appear.
+    Returns True the instant any node detects bytecode, False on timeout.
     """
-    w3 = get_w3(rpc_url)
     checksum = Web3.to_checksum_address(contract_address)
     deadline = time.time() + timeout
 
-    while time.time() < deadline:
-        code = await asyncio.to_thread(w3.eth.get_code, checksum)
-        if code not in (b"", b"\x00"):
-            return True
-        await asyncio.sleep(poll_interval)
+    tasks = [
+        asyncio.create_task(_poll_one(u, checksum, poll_interval, deadline))
+        for u in rpc_urls
+    ]
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
 
-    return False
+    for p in pending:
+        p.cancel()
+
+    return any(t.result() for t in done if not t.cancelled() and not t.exception())
