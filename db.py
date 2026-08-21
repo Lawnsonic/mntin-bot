@@ -1,5 +1,5 @@
 """
-db.py — Multi-wallet encrypted storage with target tracking.
+db.py. Multi-wallet encrypted storage with target tracking.
 
 Each user can have multiple wallets (generated or imported). Private keys
 are encrypted at rest using Fernet symmetric encryption with a master key
@@ -104,7 +104,9 @@ def create_wallet(user_id: int) -> dict:
     """
     with sqlite3.connect(DB_PATH) as conn:
         acct = Account.create()
-        enc_key = cipher_suite.encrypt(acct.key.hex().encode()).decode()
+        # Always store with 0x prefix for consistency with imported keys
+        hex_key = "0x" + acct.key.hex()
+        enc_key = cipher_suite.encrypt(hex_key.encode()).decode()
         label = _next_label(conn, user_id)
 
         cur = conn.execute(
@@ -118,7 +120,7 @@ def create_wallet(user_id: int) -> dict:
             "wallet_id": cur.lastrowid,
             "label": label,
             "address": acct.address,
-            "private_key": acct.key.hex(),
+            "private_key": hex_key,
         }
 
 
@@ -128,8 +130,19 @@ def import_wallet(user_id: int, private_key: str) -> dict:
     Validates the key, deduplicates by address, stores encrypted.
     """
     key = private_key.strip()
-    if not key.startswith("0x"):
+    if key.startswith("0x"):
+        hex_part = key[2:]
+    else:
+        hex_part = key
         key = "0x" + key
+
+    if len(hex_part) != 64:
+        raise ValueError(
+            f"Expected 64 hex characters, got {len(hex_part)}. "
+            "Check for a stray character from copying."
+        )
+    if not all(c in "0123456789abcdefABCDEF" for c in hex_part):
+        raise ValueError("Key contains a non-hex character.")
 
     account = Web3().eth.account.from_key(key)
 

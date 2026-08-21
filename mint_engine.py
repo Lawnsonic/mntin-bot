@@ -1,5 +1,5 @@
 """
-mint_engine.py — Stateless Web3 execution engine.
+mint_engine.py. Stateless Web3 execution engine.
 
 Every function accepts rpc_url and private_key as parameters so the same
 engine serves multiple users on multiple chains without any module-level
@@ -53,9 +53,14 @@ PRICE_SELECTORS = [
 # HELPERS
 # ============================================================================
 
+_w3_cache: dict = {}
+
+
 def get_w3(rpc_url: str) -> Web3:
-    """Create a Web3 instance for the given RPC endpoint."""
-    return Web3(Web3.HTTPProvider(rpc_url))
+    """Get or create a cached Web3 instance for the given RPC endpoint."""
+    if rpc_url not in _w3_cache:
+        _w3_cache[rpc_url] = Web3(Web3.HTTPProvider(rpc_url))
+    return _w3_cache[rpc_url]
 
 
 def verify_contract_exists(rpc_url: str, address: str) -> str:
