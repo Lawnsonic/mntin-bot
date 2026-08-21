@@ -176,11 +176,11 @@ def _get_active_address(user_id: int) -> Optional[str]:
 
 
 async def _fetch_balances_cached(user_id: int, address: str, force_refresh: bool = False) -> dict:
-    """Returns cached balances if younger than 15 seconds, otherwise updates concurrently."""
+    """Returns cached balances if younger than 60 seconds, otherwise updates concurrently."""
     state = user_states[user_id]
     now = time.time()
 
-    if not force_refresh and (now - state["balances_updated_at"] < 15) and state["cached_balances"]:
+    if not force_refresh and (now - state["balances_updated_at"] < 60) and state["cached_balances"]:
         return state["cached_balances"]
 
     if not address or address == "No wallet created yet":
@@ -443,7 +443,9 @@ async def withdraw_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No wallet found. Use /start to create one.")
         return
     net_key = state["network"]
-    bal = await _run_blocking(get_balance, NETWORKS[net_key]["rpc"], addr)
+    bal = state.get("cached_balances", {}).get(net_key)
+    if bal is None:
+        bal = await _run_blocking(get_balance, NETWORKS[net_key]["rpc"], addr)
     state["step"] = "WITHDRAW_AMOUNT"
     text = (
         f"\U0001f4b8 *Withdraw Funds*\n\n"
@@ -647,7 +649,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         net_key = state["network"]
-        bal = await _run_blocking(get_balance, NETWORKS[net_key]["rpc"], addr)
+        bal = state.get("cached_balances", {}).get(net_key)
+        if bal is None:
+            bal = await _run_blocking(get_balance, NETWORKS[net_key]["rpc"], addr)
         state["step"] = "WITHDRAW_AMOUNT"
         text = (
             f"\U0001f4b8 *Withdraw Funds*\n\n"
