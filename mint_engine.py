@@ -29,6 +29,16 @@ MINT_SIGNATURES = {
     "0x7ba6b3f1": ("whitelistMint(uint256,bytes32[])", ["uint256", "bytes32[]"], 0),
     "0x4a7d1d5c": ("mint(uint256,bytes)", ["uint256", "bytes"], 0),
     "0x161ac21f": ("mintPublic(address,address,address,uint256)", ["address", "address", "address", "uint256"], 3),
+    "0x379607f5": ("claim(uint256)", ["uint256"], 0),
+    "0x4e71d92d": ("claim()", [], None),
+    "0x0d9f64f7": ("publicMint()", [], None),
+    "0x0e89341c": ("freeMint()", [], None),
+    "0x347c6e00": ("freeMint(uint256)", ["uint256"], 0),
+    "0x40c10f19": ("mint(address,uint256)", ["address", "uint256"], 1),
+    "0x6a627842": ("mintPublic()", [], None),
+    "0x94b918de": ("mint(address,uint256,bytes32[])", ["address", "uint256", "bytes32[]"], 1),
+    "0xb957d0cb": ("mintAllowList(address,address,address,bytes32[],(uint80,uint48,uint48,uint16,uint16,bool))", [], None),
+    "0xd36113e6": ("mintSigned(address,address,address,uint256,bytes)", [], None),
 }
 
 PRICE_SELECTORS = [
@@ -132,6 +142,55 @@ def parse_mint_quantity(input_data: str, func_sig: str) -> int:
     except Exception:
         pass
     return 1
+
+
+def rewrite_calldata_for_recipient(calldata: str, new_recipient: str) -> str:
+    """
+    If calldata contains a target minter/recipient address, rewrite it to the new recipient.
+    Supports SeaDrop mintPublic, mint(address,uint256), mint(address,uint256,bytes32[]).
+    """
+    data = calldata if calldata.startswith("0x") else "0x" + calldata
+    if len(data) < 10:
+        return data
+
+    func_sig = data[:10].lower()
+    recip = Web3.to_checksum_address(new_recipient)
+
+    # 1. SeaDrop: mintPublic(address nftContract, address feeRecipient, address minterIfNotPayer, uint256 quantity)
+    # Selector: 0x161ac21f
+    if func_sig == "0x161ac21f" and len(data) >= 10 + 64 * 4:
+        try:
+            raw_bytes = bytes.fromhex(data[10:])
+            types = ["address", "address", "address", "uint256"]
+            decoded = list(decode(types, raw_bytes))
+            decoded[2] = recip  # replace minterIfNotPayer with bot user's address
+            return "0x161ac21f" + encode(types, decoded).hex()
+        except Exception:
+            pass
+
+    # 2. mint(address,uint256) -> selector 0x40c10f19
+    if func_sig == "0x40c10f19" and len(data) >= 10 + 64 * 2:
+        try:
+            raw_bytes = bytes.fromhex(data[10:])
+            types = ["address", "uint256"]
+            decoded = list(decode(types, raw_bytes))
+            decoded[0] = recip  # replace recipient with bot user's address
+            return "0x40c10f19" + encode(types, decoded).hex()
+        except Exception:
+            pass
+
+    # 3. mint(address,uint256,bytes32[]) -> selector 0x94b918de
+    if func_sig == "0x94b918de":
+        try:
+            raw_bytes = bytes.fromhex(data[10:])
+            types = ["address", "uint256", "bytes32[]"]
+            decoded = list(decode(types, raw_bytes))
+            decoded[0] = recip
+            return "0x94b918de" + encode(types, decoded).hex()
+        except Exception:
+            pass
+
+    return data
 
 
 # ============================================================================
@@ -391,7 +450,7 @@ def execute_copy_mint(
     dry_run: bool = True,
 ) -> str:
     """
-    Replay a detected mint transaction with bumped gas.
+    Replay a detected mint transaction with recipient rewriting and bumped gas.
     Returns tx hash on success, or a dry-run message string.
     """
     w3 = get_w3(rpc_url)
@@ -402,9 +461,13 @@ def execute_copy_mint(
     required_value_wei = w3.to_wei(value_eth, "ether")
     current_balance = w3.eth.get_balance(account.address)
     if current_balance < required_value_wei:
-        raise ValueError("Insufficient balance for copy trade.")
+        raise ValueError(
+            f"Insufficient balance. Needed {value_eth:.5f} ETH, "
+            f"wallet holds {w3.from_wei(current_balance, 'ether'):.5f} ETH."
+        )
 
-    data = raw_calldata if raw_calldata.startswith("0x") else "0x" + raw_calldata
+    # Rewrite recipient in calldata to user's wallet address
+    data = rewrite_calldata_for_recipient(raw_calldata, account.address)
 
     tx_data = {
         "from": account.address,
@@ -424,7 +487,7 @@ def execute_copy_mint(
             priority_fee = min(bumped, w3.to_wei(max_priority_gwei, "gwei"))
         else:
             priority_fee = w3.to_wei(2, "gwei")
-        max_fee = int(base_fee * 2.0) + priority_fee
+        max_fee = int(base_fee * 2.5) + priority_fee
         max_fee_limit = w3.to_wei(max_base_fee_gwei, "gwei")
         if max_fee > max_fee_limit:
             max_fee = max_fee_limit
@@ -438,8 +501,13 @@ def execute_copy_mint(
         tx_data["gasPrice"] = min(gas_price, w3.to_wei(max_base_fee_gwei, "gwei"))
 
     # Simulate
-    estimated = w3.eth.estimate_gas(tx_data)
-    tx_data["gas"] = int(estimated * 1.25)
+    try:
+        estimated = w3.eth.estimate_gas(tx_data)
+        tx_data["gas"] = int(estimated * 1.25)
+    except ContractLogicError as sim_err:
+        raise RuntimeError(f"Simulation failed (tx would revert): {sim_err}") from sim_err
+    except Exception as sim_err:
+        raise RuntimeError(f"Gas estimation failed: {sim_err}") from sim_err
 
     gas_cost_wei = tx_data["gas"] * tx_data.get(
         "maxFeePerGas", tx_data.get("gasPrice", 0)
@@ -453,7 +521,7 @@ def execute_copy_mint(
     if dry_run:
         return (
             f"[DRY_RUN_PASS] Simulated {quantity} NFTs for "
-            f"{total_cost_eth:.4f} ETH total"
+            f"{total_cost_eth:.5f} ETH total on {contract_address[:8]}..."
         )
 
     signed = w3.eth.account.sign_transaction(tx_data, private_key=private_key)

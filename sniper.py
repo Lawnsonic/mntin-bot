@@ -1,12 +1,12 @@
 """
 sniper.py. Multi-chain, multi-target, multi-user copy-mint listener.
 
-Covers the fee-market chains only (Arbitrum, Base, Ethereum). Robinhood
-Chain is excluded here since its FCFS sequencer makes gas-bump copying
-pointless there; that chain needs a separate latency-based approach.
+Covers Robinhood Chain, Arbitrum, Base, and Ethereum via low-latency
+Alchemy WebSocket connections.
 
 Runs as background asyncio tasks inside the bot process, sharing db.py,
 user_locks, and each user's live settings in bot.py's user_states.
+Sends real-time Telegram notifications on detection, simulation, and broadcast.
 """
 
 import asyncio
@@ -22,7 +22,8 @@ from mint_engine import MINT_SIGNATURES, parse_mint_quantity, execute_copy_mint,
 
 load_dotenv()
 
-FEE_MARKET_CHAINS = {
+CHAINS = {
+    "robinhood": {"http": os.getenv("ROBINHOOD_RPC"), "ws": os.getenv("ROBINHOOD_WS_RPC")},
     "arb": {"http": os.getenv("ARB_RPC"), "ws": os.getenv("ARB_WS_RPC")},
     "base": {"http": os.getenv("BASE_RPC"), "ws": os.getenv("BASE_WS_RPC")},
     "eth": {"http": os.getenv("ETH_RPC"), "ws": os.getenv("ETH_WS_RPC")},
@@ -55,8 +56,9 @@ async def _handle_target_tx(
     tx: dict,
     user_states: dict,
     user_locks: dict,
+    tg_bot=None,
 ):
-    """Process a detected target transaction and fan out to subscribed users."""
+    """Process a detected target transaction, replay it, and notify user on Telegram."""
     tx_hash = tx.get("hash")
     if isinstance(tx_hash, bytes):
         tx_hash = tx_hash.hex()
@@ -87,27 +89,60 @@ async def _handle_target_tx(
     if not subscribed_user_ids:
         return
 
-    print(f"[{chain_key}] target mint detected: {tx_hash} from {from_addr}")
+    print(f"[{chain_key}] Target mint detected: {tx_hash} from {from_addr}")
     loop = asyncio.get_running_loop()
 
     for user_id in subscribed_user_ids:
-        # Read fresh settings from DB so toggles are respected immediately
         settings = db.get_sniper_settings(user_id)
         if not settings.get("sniper_active"):
             continue
 
         state = user_states[user_id]
         state["daily_limit_eth"] = settings.get("daily_limit_eth", 0.05)
+        chat_id = state.get("chat_id", user_id)
 
         wallet_id = state.get("active_wallet_id")
         wallet = db.get_wallet_by_id(wallet_id, user_id) if wallet_id else None
         if not wallet:
             continue
 
+        # Send real-time Telegram notification on detection
+        if tg_bot and chat_id:
+            try:
+                bump = settings.get("gas_bump_percent", 30)
+                mode_str = "DRY RUN" if settings.get("dry_run", True) else "LIVE"
+                await tg_bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"\U0001f3af *Target Mint Detected!*\n\n"
+                        f"Chain: *{chain_key.upper()}*\n"
+                        f"Target: `{from_addr}`\n"
+                        f"Contract: `{contract_address}`\n"
+                        f"Qty: `{quantity}` | Value: `{value_eth:.5f} ETH`\n"
+                        f"Mode: `{mode_str}` | Gas Bump: *+{bump}%*\n\n"
+                        f"\u26a1 Executing copy..."
+                    ),
+                    parse_mode="Markdown",
+                )
+            except Exception as e:
+                print(f"Failed to send detection notification: {e}")
+
         # Shared user lock prevents nonce collision across concurrent targets
         async with user_locks[user_id]:
             if not _check_and_record_daily_limit(state, value_eth):
-                print(f"[{chain_key}] user {user_id} hit daily limit, skipping")
+                if tg_bot and chat_id:
+                    try:
+                        await tg_bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"\u26a0\ufe0f *Daily Limit Exceeded*\n"
+                                f"Spent: `{state['daily_spent_eth']:.4f}/{state['daily_limit_eth']} ETH`. "
+                                f"Skipping copy mint."
+                            ),
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
                 continue
 
             try:
@@ -118,12 +153,43 @@ async def _handle_target_tx(
                     settings.get("gas_bump_percent", 30), state.get("max_priority_gwei", 50),
                     state.get("max_base_fee_gwei", 100), settings.get("dry_run", True),
                 )
-                state["daily_spent_eth"] += value_eth
+                if not settings.get("dry_run", True):
+                    state["daily_spent_eth"] += value_eth
                 state["successful_copies"] += 1
-                print(f"[{chain_key}] user {user_id}: {result}")
+
+                # Send success Telegram notification
+                if tg_bot and chat_id:
+                    try:
+                        if settings.get("dry_run", True):
+                            await tg_bot.send_message(
+                                chat_id=chat_id,
+                                text=f"\U0001f9ea *Copy Mint Simulated (Dry Run)*\n\n`{result}`",
+                                parse_mode="Markdown",
+                            )
+                        else:
+                            await tg_bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    f"\U0001f680 *Copy Mint Broadcasted!*\n\n"
+                                    f"Network: *{chain_key.upper()}*\n"
+                                    f"TX: `{result}`"
+                                ),
+                                parse_mode="Markdown",
+                            )
+                    except Exception as e:
+                        print(f"Failed to send success notification: {e}")
+
             except Exception as e:
                 state["failed_copies"] += 1
-                print(f"[{chain_key}] user {user_id} copy failed: {e}")
+                if tg_bot and chat_id:
+                    try:
+                        await tg_bot.send_message(
+                            chat_id=chat_id,
+                            text=f"\u274c *Copy Mint Failed*\n\n`{str(e)}`",
+                            parse_mode="Markdown",
+                        )
+                    except Exception:
+                        pass
 
 
 async def _stream_chain(
@@ -132,16 +198,17 @@ async def _stream_chain(
     http_rpc: str,
     user_states: dict,
     user_locks: dict,
+    tg_bot=None,
 ):
     """Subscribe to pending transactions on one chain and process matches."""
     from websockets import connect
 
     while True:
         try:
-            async with connect(ws_url) as ws:
+            async with connect(ws_url, ping_timeout=15) as ws:
                 addresses = list(db.get_all_active_targets().keys())
                 if not addresses:
-                    await asyncio.sleep(10)
+                    await asyncio.sleep(5)
                     continue
 
                 await ws.send(json.dumps({
@@ -149,7 +216,7 @@ async def _stream_chain(
                     "params": ["alchemy_pendingTransactions", {"fromAddress": addresses}],
                 }))
                 await ws.recv()  # subscription confirmation
-                print(f"[{chain_key}] subscribed to {len(addresses)} target(s)")
+                print(f"[{chain_key}] Sniper subscribed to {len(addresses)} target(s)")
 
                 last_refresh = time.time()
                 while True:
@@ -163,26 +230,26 @@ async def _stream_chain(
 
                         # Non-blocking dispatch to keep WebSocket receive loop responsive
                         asyncio.create_task(
-                            _handle_target_tx(chain_key, http_rpc, tx, user_states, user_locks)
+                            _handle_target_tx(chain_key, http_rpc, tx, user_states, user_locks, tg_bot)
                         )
 
-                    # Re-subscribe every 60s to pick up newly added targets.
+                    # Re-subscribe every 60s to pick up newly added targets
                     if time.time() - last_refresh > 60:
                         break
         except Exception as e:
-            print(f"[{chain_key}] stream error, reconnecting in 3s: {e}")
+            print(f"[{chain_key}] WebSocket error, reconnecting in 3s: {e}")
             await asyncio.sleep(3)
 
 
-def start_sniper_listeners(user_states: dict, user_locks: dict) -> list:
-    """Call once at bot startup, from post_init. Returns list of tasks."""
+def start_sniper_listeners(user_states: dict, user_locks: dict, tg_bot=None) -> list:
+    """Call once at bot startup, from post_init. Returns list of tasks for all chains."""
     tasks = []
-    for chain_key, cfg in FEE_MARKET_CHAINS.items():
-        if not cfg["ws"]:
-            print(f"[{chain_key}] no WS RPC configured, skipping")
+    for chain_key, cfg in CHAINS.items():
+        if not cfg["ws"] or not cfg["http"]:
+            print(f"[{chain_key}] Missing RPC config, skipping")
             continue
         task = asyncio.create_task(
-            _stream_chain(chain_key, cfg["ws"], cfg["http"], user_states, user_locks)
+            _stream_chain(chain_key, cfg["ws"], cfg["http"], user_states, user_locks, tg_bot)
         )
         tasks.append(task)
     return tasks

@@ -114,6 +114,7 @@ def _default_user_state() -> dict:
         "mode": "MANUAL",
         "active_wallet_id": None,
         "menu_message_id": None,
+        "chat_id": None,
         "cached_balances": {},
         "balances_updated_at": 0,
         # Wizard step tracking
@@ -359,6 +360,7 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     state = user_states[user_id]
+    state["chat_id"] = chat_id
     state["step"] = None
 
     # Load persisted sniper settings into memory
@@ -594,6 +596,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     data = query.data
     state = user_states[user_id]
+    if query.message:
+        state["chat_id"] = query.message.chat_id
 
     # -------------------------------------------------------------- nav home
     if data in ("nav_home", "refresh_home"):
@@ -1266,6 +1270,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     state = user_states[user_id]
     chat_id = update.effective_chat.id
+    state["chat_id"] = chat_id
 
     # ------------------------------------------------ wallet import flow
     if state["step"] == "IMPORT_KEY":
@@ -1744,10 +1749,10 @@ async def post_init(application):
     ]
     await application.bot.set_my_commands(commands)
 
-    # Start multi-chain sniper listeners with shared user_locks
+    # Start multi-chain sniper listeners with shared user_locks & Telegram bot instance
     try:
         from sniper import start_sniper_listeners
-        start_sniper_listeners(user_states, user_locks)
+        start_sniper_listeners(user_states, user_locks, application.bot)
     except Exception as e:
         print(f"Sniper listeners not started: {e}")
 
