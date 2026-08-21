@@ -88,6 +88,10 @@ async def _handle_target_tx(
 
     func_sig = input_data[:10].lower()
     if func_sig not in MINT_SIGNATURES:
+        print(
+            f"[{chain_key}] Tracked wallet tx {tx_hash} has unrecognized "
+            f"selector {func_sig} (not in MINT_SIGNATURES) - skipping"
+        )
         return
 
     contract_address = tx.get("to")
@@ -297,7 +301,7 @@ async def _stream_chain(
                                             _handle_target_tx(chain_key, http_rpc, tx, user_states, user_locks, tg_bot)
                                         )
                         except Exception as e:
-                            pass
+                            print(f"[{chain_key}] Block fetch/scan failed for block {block_num}: {e}")
 
                     # Case B: alchemy_pendingTransactions message
                     elif sub_id == sub_pending:
