@@ -87,12 +87,13 @@ async def _handle_target_tx(
         return
 
     func_sig = input_data[:10].lower()
-    if func_sig not in MINT_SIGNATURES:
+    known_selector = func_sig in MINT_SIGNATURES
+    if not known_selector:
         print(
             f"[{chain_key}] Tracked wallet tx {tx_hash} has unrecognized "
-            f"selector {func_sig} (not in MINT_SIGNATURES) - skipping"
+            f"selector {func_sig} (not in MINT_SIGNATURES) - attempting "
+            f"best-effort raw calldata replay (recipient rewrite not guaranteed)"
         )
-        return
 
     contract_address = tx.get("to")
     if isinstance(contract_address, bytes):
@@ -114,6 +115,13 @@ async def _handle_target_tx(
 
     subscribed_user_ids = db.get_all_active_targets().get(from_addr, [])
     if not subscribed_user_ids:
+        return
+
+    if value_eth > 0:
+        print(
+            f"[{chain_key}] Skipping paid mint {tx_hash} from {from_addr} "
+            f"(value {value_eth:.5f} ETH) - copy mint is limited to free mints only"
+        )
         return
 
     print(f"[{chain_key}] Target mint detected: {tx_hash} from {from_addr}")
@@ -151,6 +159,12 @@ async def _handle_target_tx(
             try:
                 bump = settings.get("gas_bump_percent", 30)
                 mode_str = "DRY RUN" if settings.get("dry_run", True) else "LIVE"
+                unknown_warning = (
+                    "\n\n\u26a0\ufe0f *Unrecognized mint function* \u2014 replaying raw "
+                    "calldata as-is. Recipient may not be rewritten to your wallet "
+                    "for this contract; double-check the result."
+                    if not known_selector else ""
+                )
                 await tg_bot.send_message(
                     chat_id=chat_id,
                     text=(
@@ -159,7 +173,8 @@ async def _handle_target_tx(
                         f"Target: `{from_addr}`\n"
                         f"Contract: `{contract_address}`\n"
                         f"Qty: `{quantity}` | Value: `{value_eth:.5f} ETH`\n"
-                        f"Mode: `{mode_str}` | Gas Bump: *+{bump}%*\n\n"
+                        f"Mode: `{mode_str}` | Gas Bump: *+{bump}%*"
+                        f"{unknown_warning}\n\n"
                         f"\u26a1 Executing copy..."
                     ),
                     parse_mode="Markdown",
