@@ -62,17 +62,27 @@ async def _handle_target_tx(
     tg_bot=None,
 ):
     """Process a detected target transaction, replay it, and notify user on Telegram."""
+    # Normalize tx_hash with 0x prefix
     tx_hash = tx.get("hash")
     if isinstance(tx_hash, bytes):
         tx_hash = tx_hash.hex()
-    elif isinstance(tx_hash, str) and not tx_hash.startswith("0x"):
+    elif not isinstance(tx_hash, str):
+        tx_hash = str(tx_hash)
+    if not tx_hash.startswith("0x"):
         tx_hash = "0x" + tx_hash
+
     if not tx_hash or _mark_seen(tx_hash):
         return
 
+    # Normalize input_data with 0x prefix (Web3 HexBytes .hex() omits 0x)
     input_data = tx.get("input") or ""
     if isinstance(input_data, bytes):
         input_data = input_data.hex()
+    elif not isinstance(input_data, str):
+        input_data = str(input_data)
+    if not input_data.startswith("0x"):
+        input_data = "0x" + input_data
+
     if len(input_data) < 10:
         return
 
@@ -81,13 +91,23 @@ async def _handle_target_tx(
         return
 
     contract_address = tx.get("to")
+    if isinstance(contract_address, bytes):
+        contract_address = contract_address.hex()
+    contract_address = str(contract_address or "").strip()
+
     quantity = parse_mint_quantity(input_data, func_sig)
     value_eth = float(Web3.from_wei(int(tx.get("value", 0)), "ether"))
     target_gas_price = tx.get("gasPrice")
     target_max_fee = tx.get("maxFeePerGas")
     target_priority = tx.get("maxPriorityFeePerGas")
 
-    from_addr = (tx.get("from") or "").lower()
+    from_addr = tx.get("from")
+    if isinstance(from_addr, bytes):
+        from_addr = from_addr.hex()
+    from_addr = str(from_addr or "").lower().strip()
+    if not from_addr.startswith("0x"):
+        from_addr = "0x" + from_addr
+
     subscribed_user_ids = db.get_all_active_targets().get(from_addr, [])
     if not subscribed_user_ids:
         return
@@ -102,11 +122,23 @@ async def _handle_target_tx(
 
         state = user_states[user_id]
         state["daily_limit_eth"] = settings.get("daily_limit_eth", 0.05)
-        # In Telegram 1-on-1 chats, chat_id is always equal to user_id
         chat_id = state.get("chat_id") or user_id
 
-        wallet_id = state.get("active_wallet_id")
-        wallet = db.get_wallet_by_id(wallet_id, user_id) if wallet_id else None
+        # Robust active wallet resolution (falls back to primary wallet in DB)
+        wallet_id = state.get("active_wallet_id") or db.get_first_wallet_id(user_id)
+        if not wallet_id:
+            if tg_bot and chat_id:
+                try:
+                    await tg_bot.send_message(
+                        chat_id=chat_id,
+                        text="❌ *Copy Mint Failed*\n\nNo active wallet found. Use /start to create a wallet.",
+                        parse_mode="Markdown",
+                    )
+                except Exception:
+                    pass
+            continue
+
+        wallet = db.get_wallet_by_id(wallet_id, user_id)
         if not wallet:
             continue
 
@@ -253,7 +285,13 @@ async def _stream_chain(
                             active_targets = set(db.get_all_active_targets().keys())
                             if active_targets and block and block.transactions:
                                 for tx in block.transactions:
-                                    from_addr = (tx.get("from") or "").lower()
+                                    from_addr = tx.get("from")
+                                    if isinstance(from_addr, bytes):
+                                        from_addr = from_addr.hex()
+                                    from_addr = str(from_addr or "").lower().strip()
+                                    if not from_addr.startswith("0x"):
+                                        from_addr = "0x" + from_addr
+
                                     if from_addr in active_targets:
                                         asyncio.create_task(
                                             _handle_target_tx(chain_key, http_rpc, tx, user_states, user_locks, tg_bot)
