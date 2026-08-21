@@ -2,8 +2,8 @@
 bot.py. Bloom-style interactive multi-user Telegram bot.
 
 Button-driven UI with step-by-step wizards. Multi-wallet per user,
-multi-chain support, variable mint fee detection, multi-target sniper
-tracking. Blue menu bar with quick commands.
+multi-chain support, variable mint fee detection, sniper settings panel
+with DB persistence, Robinhood FCFS trigger. Blue menu bar.
 
 Default network: Robinhood Chain (chain ID 4663).
 """
@@ -38,6 +38,7 @@ from mint_engine import (
     parse_mint_quantity,
     MINT_SIGNATURES,
 )
+from robinhood_sniper import prepare_mint_tx, wait_for_mint_open, broadcast_via_all
 
 load_dotenv()
 
@@ -49,8 +50,6 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment variables.")
 
-# Multi-chain registry with display metadata.
-# Robinhood Chain (chain ID 4663) is its own L2 built on Arbitrum Orbit.
 NETWORKS = {
     "robinhood": {
         "name": "Robinhood",
@@ -78,6 +77,16 @@ NETWORKS = {
     },
 }
 
+# Robinhood multi-RPC blast targets (comma-separated in .env)
+ROBINHOOD_RPCS = [
+    r.strip()
+    for r in os.getenv(
+        "ROBINHOOD_RPCS",
+        os.getenv("ROBINHOOD_RPC", "https://rpc.mainnet.chain.robinhood.com"),
+    ).split(",")
+    if r.strip()
+]
+
 DEFAULT_MAX_BASE_FEE_GWEI = int(os.getenv("MAX_BASE_FEE_GWEI", "100"))
 DEFAULT_DAILY_LIMIT_ETH = float(os.getenv("DAILY_LIMIT_ETH", "0.05"))
 
@@ -97,7 +106,7 @@ def _default_user_state() -> dict:
         # Wizard step tracking
         "step": None,
         "withdraw_amount": None,
-        # Sniper settings
+        # Sniper settings (loaded from DB on menu open, written back on toggle)
         "sniper_active": False,
         "dry_run": True,
         "daily_limit_eth": DEFAULT_DAILY_LIMIT_ETH,
@@ -216,6 +225,25 @@ async def _send_home(user_id: int, chat_id: int, context, via_message=False, upd
     state["menu_message_id"] = msg.message_id
 
 
+async def _update_menu_message(user_id, chat_id, context, text, markup):
+    """Edit the tracked menu message in-place, or send a new one if it's gone."""
+    state = user_states[user_id]
+    msg_id = state.get("menu_message_id")
+    if msg_id:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=text, reply_markup=markup, parse_mode="Markdown",
+            )
+            return
+        except Exception:
+            pass
+    msg = await context.bot.send_message(
+        chat_id=chat_id, text=text, reply_markup=markup, parse_mode="Markdown"
+    )
+    state["menu_message_id"] = msg.message_id
+
+
 # ============================================================================
 # HOME DASHBOARD
 # ============================================================================
@@ -226,7 +254,6 @@ async def _build_home(user_id: int) -> tuple:
     wallets = db.get_wallets(user_id)
     active_id = _get_active_wallet_id(user_id)
 
-    # Find active wallet info
     active_label = "None"
     active_addr = "No wallet created yet"
     for w in wallets:
@@ -283,7 +310,7 @@ async def _build_home(user_id: int) -> tuple:
             ),
         ],
         [
-            InlineKeyboardButton("\U0001f3af Copy Trade", callback_data="menu_targets"),
+            InlineKeyboardButton("\U0001f3af Sniper", callback_data="menu_sniper"),
             InlineKeyboardButton("\U0001f510 Wallets", callback_data="menu_wallets"),
         ],
         [InlineKeyboardButton("\U0001f504 Refresh", callback_data="nav_home")],
@@ -301,6 +328,10 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     state = user_states[user_id]
     state["step"] = None
+
+    # Load persisted sniper settings into memory
+    settings = db.get_sniper_settings(user_id)
+    state.update(settings)
 
     # Auto-provision W1 on first ever interaction
     if not db.get_wallets(user_id):
@@ -418,29 +449,21 @@ async def network_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def targets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Alias /targets -> sniper settings panel."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     state = user_states[user_id]
     await _delete_old_menu(user_id, chat_id, context.bot)
-    targets = db.get_user_targets(user_id)
-    text = "\U0001f3af *Copy Trade Targets*\n\n"
-    if targets:
-        for i, t in enumerate(targets):
-            connector = "\u2514" if i == len(targets) - 1 else "\u251c"
-            text += f"{connector} `{t}`\n"
-    else:
-        text += "No targets tracked yet.\n"
-    text += "\nPaste a wallet address to add it as a target."
-    keyboard = []
-    for t in targets:
-        short = t[:6] + "..." + t[-4:]
-        keyboard.append([
-            InlineKeyboardButton(f"\U0001f5d1 Remove {short}", callback_data=f"rm_target_{t}")
-        ])
+
+    # Load persisted settings
+    settings = db.get_sniper_settings(user_id)
+    state.update(settings)
     state["step"] = "ADD_TARGET"
-    keyboard.append(_back_button())
+
+    text = _build_sniper_text(user_id)
+    markup = _build_sniper_keyboard(user_id)
     msg = await update.message.reply_text(
-        text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="Markdown"
+        text, reply_markup=markup, parse_mode="Markdown"
     )
     state["menu_message_id"] = msg.message_id
 
@@ -672,14 +695,53 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ---------------------------------------------------- copy trade targets
-    if data == "menu_targets":
-        targets = db.get_user_targets(user_id)
-        text, keyboard = _build_targets_view(targets)
+    # ------------------------------------------------ sniper settings menu
+    if data == "menu_sniper":
+        # Load persisted settings from DB
+        settings = db.get_sniper_settings(user_id)
+        state.update(settings)
         state["step"] = "ADD_TARGET"
         await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            _build_sniper_text(user_id),
+            reply_markup=_build_sniper_keyboard(user_id),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "toggle_sniper_active":
+        state["sniper_active"] = not state["sniper_active"]
+        db.update_sniper_settings(user_id, sniper_active=state["sniper_active"])
+        await query.edit_message_text(
+            _build_sniper_text(user_id),
+            reply_markup=_build_sniper_keyboard(user_id),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "toggle_sniper_dryrun":
+        state["dry_run"] = not state["dry_run"]
+        db.update_sniper_settings(user_id, dry_run=state["dry_run"])
+        await query.edit_message_text(
+            _build_sniper_text(user_id),
+            reply_markup=_build_sniper_keyboard(user_id),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data.startswith("set_bump_"):
+        val = data.replace("set_bump_", "")
+        if val == "custom":
+            state["step"] = "AWAITING_CUSTOM_BUMP"
+            await query.edit_message_text(
+                "Reply with a custom gas bump percentage (e.g. 75 for +75%):",
+                reply_markup=InlineKeyboardMarkup([_back_button("menu_sniper")]),
+            )
+            return
+        state["gas_bump_percent"] = int(val)
+        db.update_sniper_settings(user_id, gas_bump_percent=state["gas_bump_percent"])
+        await query.edit_message_text(
+            _build_sniper_text(user_id),
+            reply_markup=_build_sniper_keyboard(user_id),
             parse_mode="Markdown",
         )
         return
@@ -688,10 +750,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target = data.replace("rm_target_", "")
         db.remove_target(user_id, target)
         targets = db.get_user_targets(user_id)
-        text, keyboard = _build_targets_view(targets)
         await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            _build_sniper_text(user_id),
+            reply_markup=_build_sniper_keyboard(user_id),
             parse_mode="Markdown",
         )
         return
@@ -699,17 +760,17 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --------------------------------------------------- mint flow callbacks
     if data.startswith("qty_"):
         context.user_data["selected_qty"] = int(data.split("_")[1])
-        await _refresh_mint_keyboard(query, context)
+        await _refresh_mint_keyboard(query, context, user_id)
         return
 
     if data.startswith("gas_"):
         context.user_data["selected_gas"] = int(data.split("_")[1])
-        await _refresh_mint_keyboard(query, context)
+        await _refresh_mint_keyboard(query, context, user_id)
         return
 
     if data.startswith("price_"):
         context.user_data["selected_price"] = float(data.split("_")[1])
-        await _refresh_mint_keyboard(query, context)
+        await _refresh_mint_keyboard(query, context, user_id)
         return
 
     if data == "confirm_mint":
@@ -726,6 +787,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await _dispatch_mint(
             user_id, query.message.chat_id, contract, qty, price, gas, context
+        )
+        return
+
+    # ---------------------------------------- Robinhood FCFS snipe trigger
+    if data == "confirm_rbh_snipe":
+        contract = context.user_data.get("target_contract")
+        if not contract:
+            await query.edit_message_text("No contract address set. Paste one first.")
+            return
+        qty = context.user_data.get("selected_qty", 1)
+        price = context.user_data.get("selected_price", 0.0)
+        await query.edit_message_text(
+            f"\U0001f552 *FCFS Sniper Armed*\n\n"
+            f"Contract: `{contract}`\n"
+            f"Monitoring for bytecode deployment.\n"
+            f"Transaction is pre-signed and will blast via "
+            f"{len(ROBINHOOD_RPCS)} RPC(s) the moment the contract is live.\n\n"
+            f"Timeout: 10 minutes.",
+            parse_mode="Markdown",
+        )
+        asyncio.create_task(
+            _dispatch_rbh_sniper(
+                user_id, query.message.chat_id, contract, qty, price, context
+            )
         )
         return
 
@@ -749,32 +834,80 @@ def _build_wallet_text(user_id: int) -> str:
     return "\n".join(lines)
 
 
-def _build_targets_view(targets: list) -> tuple:
-    """Build the copy trade targets text and keyboard."""
-    text = "\U0001f3af *Copy Trade Targets*\n\n"
+def _build_sniper_text(user_id: int) -> str:
+    """Build the sniper settings + target list panel."""
+    state = user_states[user_id]
+    targets = db.get_user_targets(user_id)
+
+    status = "ACTIVE" if state["sniper_active"] else "INACTIVE"
+    mode = "DRY RUN" if state["dry_run"] else "LIVE"
+
+    lines = [
+        "\U0001f3af *Sniper Settings*",
+        "",
+        f"\u251c Status: *{status}*",
+        f"\u251c Mode: *{mode}*",
+        f"\u2514 Gas Bump: *+{state['gas_bump_percent']}%*",
+        "",
+        "*Tracked Targets:*",
+    ]
+
     if targets:
         for i, t in enumerate(targets):
             connector = "\u2514" if i == len(targets) - 1 else "\u251c"
-            text += f"{connector} `{t}`\n"
+            lines.append(f"{connector} `{t}`")
     else:
-        text += "No targets tracked yet.\n"
-    text += "\nPaste a wallet address to add it as a target."
+        lines.append("\u2514 None")
 
-    keyboard = []
+    lines.extend(["", "Paste a wallet address to add a target."])
+    return "\n".join(lines)
+
+
+def _build_sniper_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    """Sniper control panel with toggles, gas bump presets, and per-target remove buttons."""
+    state = user_states[user_id]
+    targets = db.get_user_targets(user_id)
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                f"{'Stop' if state['sniper_active'] else 'Start'} Sniper",
+                callback_data="toggle_sniper_active",
+            ),
+            InlineKeyboardButton(
+                f"{'Set LIVE' if state['dry_run'] else 'Set DRY RUN'}",
+                callback_data="toggle_sniper_dryrun",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                f"{'\u2705 ' if state['gas_bump_percent'] == 30 else ''}30%",
+                callback_data="set_bump_30",
+            ),
+            InlineKeyboardButton(
+                f"{'\u2705 ' if state['gas_bump_percent'] == 50 else ''}50%",
+                callback_data="set_bump_50",
+            ),
+            InlineKeyboardButton("Custom", callback_data="set_bump_custom"),
+        ],
+    ]
+
+    # Per-target remove buttons
     for t in targets:
         short = t[:6] + "..." + t[-4:]
         keyboard.append([
             InlineKeyboardButton(f"\U0001f5d1 Remove {short}", callback_data=f"rm_target_{t}")
         ])
+
     keyboard.append(_back_button())
-    return text, keyboard
+    return InlineKeyboardMarkup(keyboard)
 
 
 # ============================================================================
 # MINT KEYBOARD BUILDER & REFRESH
 # ============================================================================
 
-def _build_mint_keyboard(qty: int, gas: int, price: float) -> InlineKeyboardMarkup:
+def _build_mint_keyboard(qty: int, gas: int, price: float, network_key: str) -> InlineKeyboardMarkup:
     keyboard = [
         [
             InlineKeyboardButton(f"{'\u2705 ' if qty == 1 else ''}1", callback_data="qty_1"),
@@ -786,23 +919,38 @@ def _build_mint_keyboard(qty: int, gas: int, price: float) -> InlineKeyboardMark
             InlineKeyboardButton(f"{'\u2705 ' if price == 0.01 else ''}0.01", callback_data="price_0.01"),
             InlineKeyboardButton(f"{'\u2705 ' if price == 0.05 else ''}0.05", callback_data="price_0.05"),
         ],
-        [
+    ]
+
+    # Gas priority buttons only for fee-market chains (not Robinhood FCFS)
+    if network_key != "robinhood":
+        keyboard.append([
             InlineKeyboardButton(f"{'\u2705 ' if gas == 2 else ''}2 Gwei", callback_data="gas_2"),
             InlineKeyboardButton(f"{'\u2705 ' if gas == 5 else ''}5 Gwei", callback_data="gas_5"),
             InlineKeyboardButton(f"{'\u2705 ' if gas == 10 else ''}10 Gwei", callback_data="gas_10"),
-        ],
-        [InlineKeyboardButton("\u26a1 Confirm & Mint", callback_data="confirm_mint")],
-        _back_button(),
-    ]
+        ])
+
+    keyboard.append([InlineKeyboardButton("\u26a1 Confirm & Mint", callback_data="confirm_mint")])
+
+    # Robinhood exclusive: FCFS pre-sign snipe
+    if network_key == "robinhood":
+        keyboard.append([
+            InlineKeyboardButton(
+                "\U0001f552 FCFS Snipe (Wait for Deploy)",
+                callback_data="confirm_rbh_snipe",
+            )
+        ])
+
+    keyboard.append(_back_button())
     return InlineKeyboardMarkup(keyboard)
 
 
-async def _refresh_mint_keyboard(query, context):
+async def _refresh_mint_keyboard(query, context, user_id):
     qty = context.user_data.get("selected_qty", 1)
     gas = context.user_data.get("selected_gas", 2)
     price = context.user_data.get("selected_price", 0.0)
+    network_key = user_states[user_id]["network"]
     await query.edit_message_reply_markup(
-        reply_markup=_build_mint_keyboard(qty, gas, price)
+        reply_markup=_build_mint_keyboard(qty, gas, price, network_key)
     )
 
 
@@ -876,6 +1024,64 @@ async def _dispatch_mint(
 
 
 # ============================================================================
+# ROBINHOOD FCFS DISPATCHER
+# ============================================================================
+
+async def _dispatch_rbh_sniper(
+    user_id: int,
+    chat_id: int,
+    contract_address: str,
+    qty: int,
+    price: float,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Background task: pre-sign, wait for deploy, blast."""
+    wallet_id = _get_active_wallet_id(user_id)
+    wallet = db.get_wallet_by_id(wallet_id, user_id)
+    if not wallet:
+        await context.bot.send_message(
+            chat_id=chat_id, text="Wallet not found. Cannot arm sniper."
+        )
+        return
+
+    rpc_url = NETWORKS["robinhood"]["rpc"]
+
+    try:
+        # Pre-sign (off the event loop)
+        tx_payload = await _run_blocking(
+            prepare_mint_tx, rpc_url, wallet["private_key"],
+            contract_address, qty, price,
+        )
+
+        # Block until contract is live (10 min timeout)
+        is_live = await wait_for_mint_open(rpc_url, contract_address)
+
+        if is_live:
+            tx_hash = await broadcast_via_all(ROBINHOOD_RPCS, tx_payload["raw"])
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"\U0001f680 *FCFS Snipe Executed*\n\n"
+                    f"Target went live. Payload blasted via {len(ROBINHOOD_RPCS)} RPC(s).\n"
+                    f"TX: `{tx_hash}`"
+                ),
+                parse_mode="Markdown",
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="\u23f3 *FCFS Snipe Timeout*\nContract did not deploy within 10 minutes.",
+                parse_mode="Markdown",
+            )
+    except Exception as e:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"\U0001f6a8 *Sniper Error:*\n`{str(e)}`",
+            parse_mode="Markdown",
+        )
+
+
+# ============================================================================
 # TEXT INPUT ROUTER
 # ============================================================================
 
@@ -888,7 +1094,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ------------------------------------------------ wallet import flow
     if state["step"] == "IMPORT_KEY":
         raw_key = text
-        # Delete the message containing the private key immediately
         try:
             await context.bot.delete_message(
                 chat_id=chat_id,
@@ -907,7 +1112,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     chat_id=chat_id,
                     text=f"Import failed: {str(e)}",
                 )
-                # Return to home after failed import
                 await _send_home(user_id, chat_id, context)
                 return
             except Exception:
@@ -935,13 +1139,32 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ),
                 parse_mode="Markdown",
             )
-        # Return to dashboard after import
         await _send_home(user_id, chat_id, context)
+        return
+
+    # ---------------------------------------- custom gas bump input
+    if state["step"] == "AWAITING_CUSTOM_BUMP":
+        if not re.match(r"^\d+$", text):
+            await update.message.reply_text(
+                "Invalid percentage. Enter a positive whole number (e.g. 75):"
+            )
+            return
+        bump = int(text)
+        if bump < 0:
+            await update.message.reply_text("Must be a positive number.")
+            return
+        state["gas_bump_percent"] = bump
+        state["step"] = "ADD_TARGET"
+        db.update_sniper_settings(user_id, gas_bump_percent=bump)
+        await _update_menu_message(
+            user_id, chat_id, context,
+            _build_sniper_text(user_id),
+            _build_sniper_keyboard(user_id),
+        )
         return
 
     # ------------------------------------------ withdrawal wizard: amount
     if state["step"] == "WITHDRAW_AMOUNT":
-        # Numbers only validation
         if not re.match(r"^\d+\.?\d*$", text):
             await update.message.reply_text(
                 "Numbers only. Enter a valid amount (e.g. 0.05):"
@@ -1002,14 +1225,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"\u274c *Withdrawal Failed:*\n`{str(e)}`",
                     parse_mode="Markdown",
                 )
-        # Return to dashboard after withdrawal
         await _send_home(user_id, chat_id, context)
         return
 
     # ------------------------------------------- add target flow
     if state["step"] == "ADD_TARGET":
         if re.match(r"^0x[a-fA-F0-9]{40}$", text):
-            # Guard against adding own wallet as target
             active_addr = _get_active_address(user_id)
             if active_addr and text.lower() == active_addr.lower():
                 await update.message.reply_text(
@@ -1018,15 +1239,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             db.add_target(user_id, text)
-            state["step"] = None
-            await update.message.reply_text(
-                f"\U0001f3af Target added: `{text}`",
-                parse_mode="Markdown",
+            # Refresh sniper panel in-place
+            await _update_menu_message(
+                user_id, chat_id, context,
+                _build_sniper_text(user_id),
+                _build_sniper_keyboard(user_id),
             )
-            # Return to dashboard
-            await _send_home(user_id, chat_id, context)
             return
-        # Not an address while in target mode, ignore silently
         return
 
     # ------------------------------------------- contract address (mint)
@@ -1041,11 +1260,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["target_contract"] = text
         rpc_url = _get_rpc(user_id)
 
-        # Auto-detect mint price from contract (off the event loop)
         detected = await _run_blocking(detect_mint_price, rpc_url, text) or 0.0
         context.user_data["selected_qty"] = 1
         context.user_data["selected_gas"] = 2
         context.user_data["selected_price"] = detected
+
+        network_key = state["network"]
 
         if state["mode"] == "AUTO":
             await update.message.reply_text(
@@ -1060,21 +1280,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # MANUAL mode: show mint config keyboard
-        net_name = NETWORKS[state["network"]]["name"]
+        net_name = NETWORKS[network_key]["name"]
         await update.message.reply_text(
             f"\U0001f3af *Mint Configuration*\n\n"
             f"Contract: `{text}`\n"
             f"Detected Price: `{detected} ETH`\n"
             f"Network: *{net_name}*\n\n"
             f"Configure and confirm:",
-            reply_markup=_build_mint_keyboard(1, 2, detected),
+            reply_markup=_build_mint_keyboard(1, 2, detected, network_key),
             parse_mode="Markdown",
         )
         return
 
 
 # ============================================================================
-# MEMPOOL SNIPER (per-user background worker)
+# MEMPOOL SNIPER (per-user background worker, kept for direct invocation)
 # ============================================================================
 
 async def mempool_worker(user_id: int, chat_id: int, app):
@@ -1097,7 +1317,7 @@ async def mempool_worker(user_id: int, chat_id: int, app):
     if not targets:
         await app.bot.send_message(
             chat_id=chat_id,
-            text="No targets tracked. Add targets from the Copy Trade menu first.",
+            text="No targets tracked. Add targets from the Sniper menu first.",
         )
         state["sniper_active"] = False
         return
@@ -1115,7 +1335,7 @@ async def mempool_worker(user_id: int, chat_id: int, app):
                     ],
                 }))
 
-                await ws.recv()  # subscription confirmation
+                await ws.recv()
                 target_list = ", ".join(t[:8] + "..." for t in targets)
                 await app.bot.send_message(
                     chat_id=chat_id,
@@ -1248,7 +1468,7 @@ async def post_init(application):
         BotCommand("deposit", "Show deposit address"),
         BotCommand("withdraw", "Withdraw funds"),
         BotCommand("network", "Switch chain"),
-        BotCommand("targets", "Copy trade targets"),
+        BotCommand("targets", "Sniper settings"),
     ]
     await application.bot.set_my_commands(commands)
 

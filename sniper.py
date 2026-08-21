@@ -85,10 +85,12 @@ async def _handle_target_tx(chain_key: str, http_rpc: str, tx: dict, user_states
     loop = asyncio.get_running_loop()
 
     for user_id in subscribed_user_ids:
-        state = user_states[user_id]
-        if not state.get("sniper_active"):
+        # Read fresh settings from DB so the Stop button is respected immediately
+        settings = db.get_sniper_settings(user_id)
+        if not settings.get("sniper_active"):
             continue
 
+        state = user_states[user_id]
         wallet_id = state.get("active_wallet_id")
         wallet = db.get_wallet_by_id(wallet_id, user_id) if wallet_id else None
         if not wallet:
@@ -103,8 +105,8 @@ async def _handle_target_tx(chain_key: str, http_rpc: str, tx: dict, user_states
                 None, execute_copy_mint,
                 http_rpc, wallet["private_key"], contract_address, input_data,
                 quantity, value_eth, target_gas_price, target_max_fee, target_priority,
-                state.get("gas_bump_percent", 30), state.get("max_priority_gwei", 50),
-                state.get("max_base_fee_gwei", 100), state.get("dry_run", True),
+                settings.get("gas_bump_percent", 30), state.get("max_priority_gwei", 50),
+                state.get("max_base_fee_gwei", 100), settings.get("dry_run", True),
             )
             state["daily_spent_eth"] += value_eth
             state["successful_copies"] += 1

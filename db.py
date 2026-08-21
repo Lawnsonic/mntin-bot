@@ -54,6 +54,14 @@ def init_db():
                 UNIQUE(user_id, target_address)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS sniper_settings (
+                user_id INTEGER PRIMARY KEY,
+                sniper_active INTEGER NOT NULL DEFAULT 0,
+                dry_run INTEGER NOT NULL DEFAULT 1,
+                gas_bump_percent INTEGER NOT NULL DEFAULT 30
+            )
+        """)
         _migrate_legacy(conn)
 
 
@@ -271,6 +279,49 @@ def get_all_active_targets() -> Dict[str, List[int]]:
         ).fetchall():
             mapping.setdefault(target, []).append(user_id)
     return mapping
+
+
+# ============================================================================
+# SNIPER SETTINGS PERSISTENCE
+# ============================================================================
+
+def get_sniper_settings(user_id: int) -> dict:
+    """Load persisted sniper settings. Returns defaults if no row exists."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT sniper_active, dry_run, gas_bump_percent "
+            "FROM sniper_settings WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        if row is None:
+            return {"sniper_active": False, "dry_run": True, "gas_bump_percent": 30}
+        return {
+            "sniper_active": bool(row[0]),
+            "dry_run": bool(row[1]),
+            "gas_bump_percent": row[2],
+        }
+
+
+def update_sniper_settings(user_id: int, **fields) -> None:
+    """Upsert sniper settings. Only updates the fields you pass."""
+    existing = get_sniper_settings(user_id)
+    existing.update(fields)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO sniper_settings (user_id, sniper_active, dry_run, gas_bump_percent) "
+            "VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "sniper_active=excluded.sniper_active, "
+            "dry_run=excluded.dry_run, "
+            "gas_bump_percent=excluded.gas_bump_percent",
+            (
+                user_id,
+                int(existing["sniper_active"]),
+                int(existing["dry_run"]),
+                existing["gas_bump_percent"],
+            ),
+        )
+        conn.commit()
 
 
 # Auto-initialize on import
