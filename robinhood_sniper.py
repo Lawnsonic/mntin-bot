@@ -3,7 +3,7 @@ robinhood_sniper.py. FCFS latency-based sniper for Robinhood Chain.
 
 Robinhood Chain (chain ID 4663) uses an FCFS sequencer, meaning
 gas-bumping is pointless. Instead, this module:
-  1. Pre-signs the mint transaction (no estimate_gas round trip)
+  1. Pre-signs the mint transaction (supporting SeaDrop & direct mint)
   2. Polls for contract deployment or mint-open state
   3. Blasts the pre-signed tx to multiple RPCs concurrently
 
@@ -15,7 +15,7 @@ import time
 from typing import List
 
 from web3 import Web3
-from mint_engine import get_w3, DEFAULT_MINT_ABI
+from mint_engine import get_w3, build_mint_payload
 
 
 def prepare_mint_tx(
@@ -27,29 +27,38 @@ def prepare_mint_tx(
 ) -> dict:
     """
     Build and sign a mint transaction ahead of time.
-    Hardcodes gas to 300k to skip the estimate_gas HTTP round trip
-    that would add latency at execution time.
-    Returns dict with 'raw' (signed bytes) and 'hash' (hex string).
+    Supports both SeaDrop and custom ERC721 contracts.
+    Uses 3.0x base fee buffer so the pre-signed transaction is never
+    rejected with 'max fee per gas less than block base fee'.
     """
     w3 = get_w3(rpc_url)
     account = w3.eth.account.from_key(private_key)
-    contract = w3.eth.contract(
-        address=Web3.to_checksum_address(contract_address),
-        abi=DEFAULT_MINT_ABI,
+
+    target_addr, calldata = build_mint_payload(
+        rpc_url, account.address, contract_address, quantity
     )
 
+    total_value_wei = w3.to_wei(value_eth * quantity, "ether")
     tx_data = {
         "from": account.address,
-        "value": w3.to_wei(value_eth * quantity, "ether"),
+        "to": target_addr,
+        "data": calldata,
+        "value": total_value_wei,
         "nonce": w3.eth.get_transaction_count(account.address, "pending"),
         "chainId": w3.eth.chain_id,
-        "gas": 300000,
-        "gasPrice": w3.eth.gas_price,
+        "gas": 350000,
     }
 
-    tx = contract.functions.mint(quantity).build_transaction(tx_data)
-    signed = w3.eth.account.sign_transaction(tx, private_key=private_key)
+    latest_block = w3.eth.get_block("latest")
+    if latest_block.get("baseFeePerGas") is not None:
+        base_fee = latest_block["baseFeePerGas"]
+        priority_fee = w3.to_wei(0.1, "gwei")
+        tx_data["maxFeePerGas"] = int(base_fee * 3.0) + priority_fee
+        tx_data["maxPriorityFeePerGas"] = priority_fee
+    else:
+        tx_data["gasPrice"] = int(w3.eth.gas_price * 2.0)
 
+    signed = w3.eth.account.sign_transaction(tx_data, private_key=private_key)
     return {"raw": signed.raw_transaction, "hash": w3.to_hex(signed.hash)}
 
 
@@ -71,7 +80,14 @@ async def broadcast_via_all(rpc_urls: List[str], raw_tx: bytes) -> str:
     for p in pending:
         p.cancel()
 
-    return Web3.to_hex(list(done)[0].result())
+    for t in done:
+        if not t.cancelled() and not t.exception():
+            return Web3.to_hex(t.result())
+
+    for t in done:
+        if t.exception():
+            raise t.exception()
+    return ""
 
 
 async def _poll_one(rpc_url: str, checksum: str, poll_interval: float, deadline: float) -> bool:
@@ -80,7 +96,7 @@ async def _poll_one(rpc_url: str, checksum: str, poll_interval: float, deadline:
     while time.time() < deadline:
         try:
             code = await asyncio.to_thread(w3.eth.get_code, checksum)
-            if code not in (b"", b"\x00"):
+            if code not in (b"", b"\x00", "0x", b"0x"):
                 return True
         except Exception:
             pass  # Transient RPC hiccup; keep polling
