@@ -5,8 +5,8 @@ Covers the fee-market chains only (Arbitrum, Base, Ethereum). Robinhood
 Chain is excluded here since its FCFS sequencer makes gas-bump copying
 pointless there; that chain needs a separate latency-based approach.
 
-Runs as background asyncio tasks inside the bot process, sharing db.py
-and each user's live settings in bot.py's user_states.
+Runs as background asyncio tasks inside the bot process, sharing db.py,
+user_locks, and each user's live settings in bot.py's user_states.
 """
 
 import asyncio
@@ -49,7 +49,13 @@ def _check_and_record_daily_limit(state: dict, amount_eth: float) -> bool:
     return (state["daily_spent_eth"] + amount_eth) <= state["daily_limit_eth"]
 
 
-async def _handle_target_tx(chain_key: str, http_rpc: str, tx: dict, user_states: dict):
+async def _handle_target_tx(
+    chain_key: str,
+    http_rpc: str,
+    tx: dict,
+    user_states: dict,
+    user_locks: dict,
+):
     """Process a detected target transaction and fan out to subscribed users."""
     tx_hash = tx.get("hash")
     if isinstance(tx_hash, bytes):
@@ -85,38 +91,48 @@ async def _handle_target_tx(chain_key: str, http_rpc: str, tx: dict, user_states
     loop = asyncio.get_running_loop()
 
     for user_id in subscribed_user_ids:
-        # Read fresh settings from DB so the Stop button is respected immediately
+        # Read fresh settings from DB so toggles are respected immediately
         settings = db.get_sniper_settings(user_id)
         if not settings.get("sniper_active"):
             continue
 
         state = user_states[user_id]
+        state["daily_limit_eth"] = settings.get("daily_limit_eth", 0.05)
+
         wallet_id = state.get("active_wallet_id")
         wallet = db.get_wallet_by_id(wallet_id, user_id) if wallet_id else None
         if not wallet:
             continue
 
-        if not _check_and_record_daily_limit(state, value_eth):
-            print(f"[{chain_key}] user {user_id} hit daily limit, skipping")
-            continue
+        # Shared user lock prevents nonce collision across concurrent targets
+        async with user_locks[user_id]:
+            if not _check_and_record_daily_limit(state, value_eth):
+                print(f"[{chain_key}] user {user_id} hit daily limit, skipping")
+                continue
 
-        try:
-            result = await loop.run_in_executor(
-                None, execute_copy_mint,
-                http_rpc, wallet["private_key"], contract_address, input_data,
-                quantity, value_eth, target_gas_price, target_max_fee, target_priority,
-                settings.get("gas_bump_percent", 30), state.get("max_priority_gwei", 50),
-                state.get("max_base_fee_gwei", 100), settings.get("dry_run", True),
-            )
-            state["daily_spent_eth"] += value_eth
-            state["successful_copies"] += 1
-            print(f"[{chain_key}] user {user_id}: {result}")
-        except Exception as e:
-            state["failed_copies"] += 1
-            print(f"[{chain_key}] user {user_id} copy failed: {e}")
+            try:
+                result = await loop.run_in_executor(
+                    None, execute_copy_mint,
+                    http_rpc, wallet["private_key"], contract_address, input_data,
+                    quantity, value_eth, target_gas_price, target_max_fee, target_priority,
+                    settings.get("gas_bump_percent", 30), state.get("max_priority_gwei", 50),
+                    state.get("max_base_fee_gwei", 100), settings.get("dry_run", True),
+                )
+                state["daily_spent_eth"] += value_eth
+                state["successful_copies"] += 1
+                print(f"[{chain_key}] user {user_id}: {result}")
+            except Exception as e:
+                state["failed_copies"] += 1
+                print(f"[{chain_key}] user {user_id} copy failed: {e}")
 
 
-async def _stream_chain(chain_key: str, ws_url: str, http_rpc: str, user_states: dict):
+async def _stream_chain(
+    chain_key: str,
+    ws_url: str,
+    http_rpc: str,
+    user_states: dict,
+    user_locks: dict,
+):
     """Subscribe to pending transactions on one chain and process matches."""
     from websockets import connect
 
@@ -144,10 +160,13 @@ async def _stream_chain(chain_key: str, ws_url: str, http_rpc: str, user_states:
                             tx = tx_data
                         else:
                             tx = get_w3(http_rpc).eth.get_transaction(tx_data)
-                        await _handle_target_tx(chain_key, http_rpc, tx, user_states)
+
+                        # Non-blocking dispatch to keep WebSocket receive loop responsive
+                        asyncio.create_task(
+                            _handle_target_tx(chain_key, http_rpc, tx, user_states, user_locks)
+                        )
 
                     # Re-subscribe every 60s to pick up newly added targets.
-                    # Brief gap on reconnect where events can be missed.
                     if time.time() - last_refresh > 60:
                         break
         except Exception as e:
@@ -155,7 +174,7 @@ async def _stream_chain(chain_key: str, ws_url: str, http_rpc: str, user_states:
             await asyncio.sleep(3)
 
 
-def start_sniper_listeners(user_states: dict) -> list:
+def start_sniper_listeners(user_states: dict, user_locks: dict) -> list:
     """Call once at bot startup, from post_init. Returns list of tasks."""
     tasks = []
     for chain_key, cfg in FEE_MARKET_CHAINS.items():
@@ -163,7 +182,7 @@ def start_sniper_listeners(user_states: dict) -> list:
             print(f"[{chain_key}] no WS RPC configured, skipping")
             continue
         task = asyncio.create_task(
-            _stream_chain(chain_key, cfg["ws"], cfg["http"], user_states)
+            _stream_chain(chain_key, cfg["ws"], cfg["http"], user_states, user_locks)
         )
         tasks.append(task)
     return tasks

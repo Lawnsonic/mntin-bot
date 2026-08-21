@@ -64,9 +64,14 @@ def init_db():
                 user_id INTEGER PRIMARY KEY,
                 sniper_active INTEGER NOT NULL DEFAULT 0,
                 dry_run INTEGER NOT NULL DEFAULT 1,
-                gas_bump_percent INTEGER NOT NULL DEFAULT 30
+                gas_bump_percent INTEGER NOT NULL DEFAULT 30,
+                daily_limit_eth REAL NOT NULL DEFAULT 0.05
             )
         """)
+        try:
+            conn.execute("ALTER TABLE sniper_settings ADD COLUMN daily_limit_eth REAL NOT NULL DEFAULT 0.05")
+        except sqlite3.OperationalError:
+            pass
         _migrate_legacy(conn)
 
 
@@ -294,16 +299,22 @@ def get_sniper_settings(user_id: int) -> dict:
     """Load persisted sniper settings. Returns defaults if no row exists."""
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT sniper_active, dry_run, gas_bump_percent "
+            "SELECT sniper_active, dry_run, gas_bump_percent, daily_limit_eth "
             "FROM sniper_settings WHERE user_id = ?",
             (user_id,),
         ).fetchone()
         if row is None:
-            return {"sniper_active": False, "dry_run": True, "gas_bump_percent": 30}
+            return {
+                "sniper_active": False,
+                "dry_run": True,
+                "gas_bump_percent": 30,
+                "daily_limit_eth": 0.05,
+            }
         return {
             "sniper_active": bool(row[0]),
             "dry_run": bool(row[1]),
             "gas_bump_percent": row[2],
+            "daily_limit_eth": float(row[3]) if row[3] is not None else 0.05,
         }
 
 
@@ -313,17 +324,19 @@ def update_sniper_settings(user_id: int, **fields) -> None:
     existing.update(fields)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO sniper_settings (user_id, sniper_active, dry_run, gas_bump_percent) "
-            "VALUES (?, ?, ?, ?) "
+            "INSERT INTO sniper_settings (user_id, sniper_active, dry_run, gas_bump_percent, daily_limit_eth) "
+            "VALUES (?, ?, ?, ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "sniper_active=excluded.sniper_active, "
             "dry_run=excluded.dry_run, "
-            "gas_bump_percent=excluded.gas_bump_percent",
+            "gas_bump_percent=excluded.gas_bump_percent, "
+            "daily_limit_eth=excluded.daily_limit_eth",
             (
                 user_id,
                 int(existing["sniper_active"]),
                 int(existing["dry_run"]),
                 existing["gas_bump_percent"],
+                float(existing["daily_limit_eth"]),
             ),
         )
         conn.commit()
