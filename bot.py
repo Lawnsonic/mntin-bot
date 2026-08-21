@@ -53,6 +53,14 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment variables.")
 
+# Comma-separated Telegram user IDs allowed to use /restore_db.
+# Set this in Railway variables, e.g. ADMIN_USER_IDS=123456789,987654321
+ADMIN_USER_IDS = {
+    int(uid.strip())
+    for uid in os.getenv("ADMIN_USER_IDS", "").split(",")
+    if uid.strip().isdigit()
+}
+
 NETWORKS = {
     "robinhood": {
         "name": "Robinhood",
@@ -469,6 +477,88 @@ async def targets_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, reply_markup=markup, parse_mode="Markdown"
     )
     state["menu_message_id"] = msg.message_id
+
+
+async def restore_db_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Admin-only. One-time DB restore path: arm the bot, then send users.db
+    as a Telegram document in the next message. Intended for migrating an
+    existing users.db onto a fresh deploy's persistent volume, without
+    needing SSH/CLI access to the host.
+    """
+    user_id = update.effective_user.id
+    if not ADMIN_USER_IDS:
+        await update.message.reply_text(
+            "ADMIN_USER_IDS is not configured. Set it in your environment "
+            "variables before using this command."
+        )
+        return
+    if user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("Not authorized.")
+        return
+
+    user_states[user_id]["step"] = "AWAITING_DB_RESTORE"
+    await update.message.reply_text(
+        "\u26a0\ufe0f *DB Restore Armed*\n\n"
+        "Send `users.db` as a file attachment now to overwrite the live "
+        "database. The current file will be backed up first. Send /cancel "
+        "to abort.",
+        parse_mode="Markdown",
+    )
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Receives users.db when a restore is armed via /restore_db."""
+    user_id = update.effective_user.id
+    state = user_states[user_id]
+
+    if state.get("step") != "AWAITING_DB_RESTORE" or user_id not in ADMIN_USER_IDS:
+        return  # ignore unsolicited documents
+
+    state["step"] = None
+    doc = update.message.document
+
+    tg_file = await context.bot.get_file(doc.file_id)
+    incoming_path = os.path.join(db.DATA_DIR, "_incoming_users.db")
+    await tg_file.download_to_drive(incoming_path)
+
+    # Sanity check: real SQLite files start with this 16-byte header.
+    with open(incoming_path, "rb") as f:
+        header = f.read(16)
+    if header != b"SQLite format 3\x00":
+        os.remove(incoming_path)
+        await update.message.reply_text(
+            "\u274c That file does not look like a SQLite database. "
+            "Restore aborted, nothing was overwritten."
+        )
+        return
+
+    async with user_locks[user_id]:
+        if os.path.exists(db.DB_PATH):
+            backup_path = db.DB_PATH + f".bak.{int(time.time())}"
+            os.replace(db.DB_PATH, backup_path)
+        else:
+            backup_path = None
+        os.replace(incoming_path, db.DB_PATH)
+
+    try:
+        db.init_db()
+        with __import__("sqlite3").connect(db.DB_PATH) as conn:
+            wallet_count = conn.execute("SELECT COUNT(*) FROM wallets").fetchone()[0]
+    except Exception as e:
+        await update.message.reply_text(f"\u26a0\ufe0f Restored, but verification failed: {e}")
+        return
+
+    msg = f"\u2705 Restored. `{wallet_count}` wallet row(s) found."
+    if backup_path:
+        msg += f"\nPrevious file backed up to `{os.path.basename(backup_path)}`."
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
+async def cancel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancels any pending wizard step, including an armed DB restore."""
+    user_states[update.effective_user.id]["step"] = None
+    await update.message.reply_text("Cancelled.")
 
 
 # ============================================================================
@@ -1521,6 +1611,11 @@ def main():
     app.add_handler(CommandHandler("withdraw", withdraw_cmd))
     app.add_handler(CommandHandler("network", network_cmd))
     app.add_handler(CommandHandler("targets", targets_cmd))
+
+    # Admin-only one-time DB restore (see ADMIN_USER_IDS)
+    app.add_handler(CommandHandler("restore_db", restore_db_cmd))
+    app.add_handler(CommandHandler("cancel", cancel_cmd))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # Buttons and text input
     app.add_handler(CallbackQueryHandler(handle_callback))

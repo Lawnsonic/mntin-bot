@@ -25,7 +25,12 @@ if not ENCRYPTION_KEY:
     )
 
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "users.db")
+
+# DATA_DIR lets you point the DB at a mounted persistent volume (e.g. on
+# Railway). Falls back to the project directory for local dev.
+DATA_DIR = os.getenv("DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+os.makedirs(DATA_DIR, exist_ok=True)
+DB_PATH = os.path.join(DATA_DIR, "users.db")
 
 
 # ============================================================================
