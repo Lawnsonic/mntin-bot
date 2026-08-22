@@ -501,7 +501,7 @@ def execute_copy_mint(
         tx_data["gasPrice"] = min(gas_price, w3.to_wei(max_base_fee_gwei, "gwei"))
 
     # Simulate. Estimate using the *real* base fee, not the bumped
-    # maxFeePerGas we intend to sign with — many nodes check wallet
+    # maxFeePerGas we intend to sign with - many nodes check wallet
     # affordability during eth_estimateGas using whatever fee field is
     # already on the tx, so a large bump (e.g. 2.5x base fee) can trip a
     # false "insufficient funds for transfer" even when the wallet can
