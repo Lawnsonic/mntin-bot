@@ -302,6 +302,16 @@ async def _stream_chain(
 
                     # Case A: newHeads block message -> scan all txs in block
                     if sub_id == sub_heads and isinstance(res, dict) and "number" in res:
+                        # Check targets FIRST, before spending a single CU. The bug that
+                        # burned the 30M-CU/day free tier lived here: this used to fetch
+                        # the full block (every tx, full payload - the expensive call)
+                        # unconditionally on every block, on every chain, even with zero
+                        # targets tracked. The active_targets check only ran afterward,
+                        # so idle background scanning paid full price for nothing.
+                        active_targets = set(db.get_all_active_targets().keys())
+                        if not active_targets:
+                            continue
+
                         block_num = int(res["number"], 16)
                         # Fetch full block asynchronously. The WS node can announce a
                         # block slightly before the HTTP RPC node has it indexed, so retry
@@ -317,8 +327,7 @@ async def _stream_chain(
                                 else:
                                     print(f"[{chain_key}] Block fetch/scan failed for block {block_num} after 3 attempts: {e}")
                         try:
-                            active_targets = set(db.get_all_active_targets().keys())
-                            if active_targets and block and block.transactions:
+                            if block and block.transactions:
                                 for tx in block.transactions:
                                     from_addr = tx.get("from")
                                     if isinstance(from_addr, bytes):

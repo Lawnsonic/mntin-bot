@@ -6,6 +6,7 @@ across Ethereum, Robinhood Chain, Base, and Arbitrum.
 """
 
 import concurrent.futures
+import time
 from typing import Optional, Tuple, List
 
 from web3 import Web3
@@ -248,16 +249,26 @@ def get_seadrop_public_drop(rpc_url: str, contract_address: str) -> Tuple[bool, 
     return False, None, None
 
 
+_price_cache: dict = {}
+_PRICE_CACHE_TTL = 300  # seconds; bounded so a mid-drop price step (presale -> public) isn't served stale forever
+
+
 def detect_mint_price(rpc_url: str, contract_address: str) -> Optional[float]:
     """
     Detect per-token mint price across SeaDrop and custom NFT contracts.
     """
+    checksum = Web3.to_checksum_address(contract_address)
+    cache_key = (rpc_url, checksum.lower())
+    cached = _price_cache.get(cache_key)
+    if cached and time.time() - cached[1] < _PRICE_CACHE_TTL:
+        return cached[0]
+
     is_sd, sd_price, _ = get_seadrop_public_drop(rpc_url, contract_address)
     if is_sd and sd_price is not None:
+        _price_cache[cache_key] = (sd_price, time.time())
         return sd_price
 
     w3 = get_w3(rpc_url)
-    checksum = Web3.to_checksum_address(contract_address)
 
     def _probe_selector(selector: str) -> Optional[float]:
         try:
@@ -275,7 +286,10 @@ def detect_mint_price(rpc_url: str, contract_address: str) -> Optional[float]:
 
     for price in results:
         if price is not None:
+            _price_cache[cache_key] = (price, time.time())
             return price
+
+    _price_cache[cache_key] = (0.0, time.time())
     return 0.0
 
 
