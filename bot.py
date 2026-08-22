@@ -124,6 +124,8 @@ def _default_user_state() -> dict:
         "sniper_active": False,
         "dry_run": True,
         "daily_limit_eth": DEFAULT_DAILY_LIMIT_ETH,
+        "price_mode": "FREE_ONLY",
+        "max_mint_price_eth": 0.01,
         "max_base_fee_gwei": DEFAULT_MAX_BASE_FEE_GWEI,
         "gas_bump_percent": 30,
         "max_priority_gwei": 50,
@@ -851,6 +853,30 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data == "toggle_price_mode":
+        curr = state.get("price_mode", "FREE_ONLY")
+        new_mode = "CAPPED" if curr == "FREE_ONLY" else "FREE_ONLY"
+        state["price_mode"] = new_mode
+        db.update_sniper_settings(user_id, price_mode=new_mode)
+        await query.edit_message_text(
+            _build_sniper_text(user_id),
+            reply_markup=_build_sniper_keyboard(user_id),
+            parse_mode="Markdown",
+        )
+        return
+
+    if data == "set_max_price_prompt":
+        state["step"] = "AWAITING_MAX_PRICE"
+        max_price = state.get("max_mint_price_eth", 0.01)
+        await query.edit_message_text(
+            f"\U0001f3af *Set Max Mint Price Cap*\n\n"
+            f"Current cap: `{max_price:.4f} ETH`\n\n"
+            f"Reply with the maximum ETH value allowed per copy mint (e.g. 0.01, 0.05):",
+            reply_markup=InlineKeyboardMarkup([_back_button("menu_sniper")]),
+            parse_mode="Markdown",
+        )
+        return
+
     if data.startswith("set_bump_"):
         val = data.replace("set_bump_", "")
         if val == "custom":
@@ -1004,11 +1030,19 @@ def _build_sniper_text(user_id: int) -> str:
     cap = state.get("daily_limit_eth", DEFAULT_DAILY_LIMIT_ETH)
     spent = state.get("daily_spent_eth", 0.0)
 
+    price_mode = state.get("price_mode", "FREE_ONLY")
+    max_price = state.get("max_mint_price_eth", 0.01)
+    if price_mode == "FREE_ONLY":
+        price_display = "Free Mints Only (0 ETH)"
+    else:
+        price_display = f"Capped (<= {max_price:.4f} ETH)"
+
     lines = [
         "\U0001f3af *Copy Mint Settings*",
         "",
         f"\u251c Status: *{status}*",
         f"\u251c Execution: *{mode}*",
+        f"\u251c Price Filter: *{price_display}*",
         f"\u251c Daily Cap: *{cap} ETH* (Spent: `{spent:.4f} ETH`)",
         f"\u2514 Gas Bump: *+{state['gas_bump_percent']}%*",
         "",
@@ -1027,13 +1061,17 @@ def _build_sniper_text(user_id: int) -> str:
 
 
 def _build_sniper_keyboard(user_id: int) -> InlineKeyboardMarkup:
-    """Copy mint control panel with toggles, gas bump presets, daily limit, and per-target remove buttons."""
+    """Copy mint control panel with toggles, price filter, gas bump presets, daily limit, and per-target remove buttons."""
     state = user_states[user_id]
     targets = db.get_user_targets(user_id)
     bump = state["gas_bump_percent"]
     is_custom = bump not in (30, 50)
     custom_label = f"\u2705 {bump}%" if is_custom else "Custom"
     cap = state.get("daily_limit_eth", DEFAULT_DAILY_LIMIT_ETH)
+
+    price_mode = state.get("price_mode", "FREE_ONLY")
+    max_price = state.get("max_mint_price_eth", 0.01)
+    filter_label = "Filter: Free Only" if price_mode == "FREE_ONLY" else f"Filter: <= {max_price:.4f} ETH"
 
     keyboard = [
         [
@@ -1047,6 +1085,10 @@ def _build_sniper_keyboard(user_id: int) -> InlineKeyboardMarkup:
                 f"Execution: {'Dry Run' if state['dry_run'] else 'LIVE'}",
                 callback_data="toggle_sniper_dryrun",
             ),
+        ],
+        [
+            InlineKeyboardButton(filter_label, callback_data="toggle_price_mode"),
+            InlineKeyboardButton("\U0001f4b5 Set Price Cap", callback_data="set_max_price_prompt"),
         ],
         [
             InlineKeyboardButton(
@@ -1381,6 +1423,38 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             err = await update.message.reply_text(
                 "Invalid amount. Enter a positive number in ETH (e.g. 0.1 or 2.0):"
+            )
+            asyncio.create_task(_delete_after(chat_id, err.message_id, 5, context))
+        return
+
+    # ---------------------------------------- custom max mint price input
+    if state["step"] == "AWAITING_MAX_PRICE":
+        try:
+            await context.bot.delete_message(
+                chat_id=chat_id,
+                message_id=update.message.message_id,
+            )
+        except Exception:
+            pass
+
+        try:
+            val = float(text)
+            if not 0.0 <= val <= 100.0:
+                raise ValueError
+
+            state["max_mint_price_eth"] = val
+            state["price_mode"] = "CAPPED"
+            state["step"] = "ADD_TARGET"
+            db.update_sniper_settings(user_id, max_mint_price_eth=val, price_mode="CAPPED")
+
+            await _update_menu_message(
+                user_id, chat_id, context,
+                _build_sniper_text(user_id),
+                _build_sniper_keyboard(user_id),
+            )
+        except ValueError:
+            err = await update.message.reply_text(
+                "Invalid amount. Enter a non-negative number in ETH between 0.0 and 100.0 (e.g. 0.025):"
             )
             asyncio.create_task(_delete_after(chat_id, err.message_id, 5, context))
         return

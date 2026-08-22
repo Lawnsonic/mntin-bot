@@ -117,19 +117,24 @@ async def _handle_target_tx(
     if not subscribed_user_ids:
         return
 
-    if value_eth > 0:
-        print(
-            f"[{chain_key}] Skipping paid mint {tx_hash} from {from_addr} "
-            f"(value {value_eth:.5f} ETH) - copy mint is limited to free mints only"
-        )
-        return
-
     print(f"[{chain_key}] Target mint detected: {tx_hash} from {from_addr}")
     loop = asyncio.get_running_loop()
 
     for user_id in subscribed_user_ids:
         settings = db.get_sniper_settings(user_id)
         if not settings.get("sniper_active"):
+            continue
+
+        # Price Filter Validation
+        price_mode = settings.get("price_mode", "FREE_ONLY")
+        max_price = float(settings.get("max_mint_price_eth", 0.01))
+
+        if price_mode == "FREE_ONLY" and value_eth > 0.0:
+            print(f"[{chain_key}] user {user_id}: Skipped paid mint ({value_eth:.5f} ETH) in Free Only mode.")
+            continue
+
+        if price_mode == "CAPPED" and value_eth > max_price:
+            print(f"[{chain_key}] user {user_id}: Skipped mint price ({value_eth:.5f} ETH) exceeding cap of {max_price:.4f} ETH.")
             continue
 
         state = user_states[user_id]
@@ -160,7 +165,7 @@ async def _handle_target_tx(
                 bump = settings.get("gas_bump_percent", 30)
                 mode_str = "DRY RUN" if settings.get("dry_run", True) else "LIVE"
                 unknown_warning = (
-                    "\n\n\u26a0\ufe0f *Unrecognized mint function* \u2014 replaying raw "
+                    "\n\n\u26a0\ufe0f *Unrecognized mint function* - replaying raw "
                     "calldata as-is. Recipient may not be rewritten to your wallet "
                     "for this contract; double-check the result."
                     if not known_selector else ""

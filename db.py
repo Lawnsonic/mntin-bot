@@ -65,11 +65,21 @@ def init_db():
                 sniper_active INTEGER NOT NULL DEFAULT 0,
                 dry_run INTEGER NOT NULL DEFAULT 1,
                 gas_bump_percent INTEGER NOT NULL DEFAULT 30,
-                daily_limit_eth REAL NOT NULL DEFAULT 0.05
+                daily_limit_eth REAL NOT NULL DEFAULT 0.05,
+                price_mode TEXT NOT NULL DEFAULT 'FREE_ONLY',
+                max_mint_price_eth REAL NOT NULL DEFAULT 0.01
             )
         """)
         try:
             conn.execute("ALTER TABLE sniper_settings ADD COLUMN daily_limit_eth REAL NOT NULL DEFAULT 0.05")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE sniper_settings ADD COLUMN price_mode TEXT NOT NULL DEFAULT 'FREE_ONLY'")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            conn.execute("ALTER TABLE sniper_settings ADD COLUMN max_mint_price_eth REAL NOT NULL DEFAULT 0.01")
         except sqlite3.OperationalError:
             pass
         _migrate_legacy(conn)
@@ -299,7 +309,7 @@ def get_sniper_settings(user_id: int) -> dict:
     """Load persisted sniper settings. Returns defaults if no row exists."""
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT sniper_active, dry_run, gas_bump_percent, daily_limit_eth "
+            "SELECT sniper_active, dry_run, gas_bump_percent, daily_limit_eth, price_mode, max_mint_price_eth "
             "FROM sniper_settings WHERE user_id = ?",
             (user_id,),
         ).fetchone()
@@ -309,12 +319,16 @@ def get_sniper_settings(user_id: int) -> dict:
                 "dry_run": True,
                 "gas_bump_percent": 30,
                 "daily_limit_eth": 0.05,
+                "price_mode": "FREE_ONLY",
+                "max_mint_price_eth": 0.01,
             }
         return {
             "sniper_active": bool(row[0]),
             "dry_run": bool(row[1]),
             "gas_bump_percent": row[2],
             "daily_limit_eth": float(row[3]) if row[3] is not None else 0.05,
+            "price_mode": str(row[4]) if row[4] is not None else "FREE_ONLY",
+            "max_mint_price_eth": float(row[5]) if row[5] is not None else 0.01,
         }
 
 
@@ -324,19 +338,23 @@ def update_sniper_settings(user_id: int, **fields) -> None:
     existing.update(fields)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO sniper_settings (user_id, sniper_active, dry_run, gas_bump_percent, daily_limit_eth) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "INSERT INTO sniper_settings (user_id, sniper_active, dry_run, gas_bump_percent, daily_limit_eth, price_mode, max_mint_price_eth) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(user_id) DO UPDATE SET "
             "sniper_active=excluded.sniper_active, "
             "dry_run=excluded.dry_run, "
             "gas_bump_percent=excluded.gas_bump_percent, "
-            "daily_limit_eth=excluded.daily_limit_eth",
+            "daily_limit_eth=excluded.daily_limit_eth, "
+            "price_mode=excluded.price_mode, "
+            "max_mint_price_eth=excluded.max_mint_price_eth",
             (
                 user_id,
                 int(existing["sniper_active"]),
                 int(existing["dry_run"]),
                 existing["gas_bump_percent"],
                 float(existing["daily_limit_eth"]),
+                str(existing["price_mode"]),
+                float(existing["max_mint_price_eth"]),
             ),
         )
         conn.commit()
